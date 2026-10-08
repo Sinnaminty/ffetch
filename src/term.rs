@@ -25,7 +25,10 @@ impl ColorMode {
             .is_ok_and(|t| t.contains("truecolor") || t.contains("24bit") || t.contains("direct"));
         let truecolor_app = env::var_os("WT_SESSION").is_some()
             || env::var("TERM_PROGRAM").is_ok_and(|p| {
-                matches!(p.as_str(), "iTerm.app" | "WezTerm" | "vscode" | "ghostty" | "Hyper")
+                matches!(
+                    p.as_str(),
+                    "iTerm.app" | "WezTerm" | "vscode" | "ghostty" | "Hyper"
+                )
             });
         if truecolor_env || truecolor_term || truecolor_app {
             Self::TrueColor
@@ -57,13 +60,23 @@ impl ColorMode {
             _ => format!("{BOLD}{}{s}{RESET}", self.fg(c)),
         }
     }
+
+    /// Like `paint`, but without bold.
+    pub fn tint(self, s: &str, c: Rgb) -> String {
+        match self {
+            Self::None => s.to_string(),
+            _ => format!("{}{s}{RESET}", self.fg(c)),
+        }
+    }
 }
 
 /// Nearest colour in the xterm 256-colour palette (6x6x6 cube or grey ramp).
 fn to_ansi256(Rgb(r, g, b): Rgb) -> u8 {
     const LEVELS: [i32; 6] = [0, 95, 135, 175, 215, 255];
     let nearest_level = |v: u8| {
-        (0..6).min_by_key(|&i| (LEVELS[i] - v as i32).abs()).unwrap()
+        (0..6)
+            .min_by_key(|&i| (LEVELS[i] - v as i32).abs())
+            .unwrap()
     };
     let (ri, gi, bi) = (nearest_level(r), nearest_level(g), nearest_level(b));
     let cube = (LEVELS[ri], LEVELS[gi], LEVELS[bi]);
@@ -88,4 +101,30 @@ pub fn size() -> Option<(usize, usize)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
     (ok && ws.ws_col > 0 && ws.ws_row > 0).then_some((ws.ws_col as usize, ws.ws_row as usize))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_ansi256_known_colors() {
+        assert_eq!(to_ansi256(Rgb(0, 0, 0)), 16);
+        assert_eq!(to_ansi256(Rgb(255, 255, 255)), 231);
+        assert_eq!(to_ansi256(Rgb(255, 0, 0)), 196);
+        assert_eq!(to_ansi256(Rgb(95, 135, 175)), 67);
+        // Greys go to the grey ramp rather than the coarser cube.
+        assert_eq!(to_ansi256(Rgb(128, 128, 128)), 244);
+        assert_eq!(to_ansi256(Rgb(0xc3, 0x3e, 0x58)), 131);
+    }
+
+    #[test]
+    fn color_codes_per_mode() {
+        let c = Rgb(195, 62, 88);
+        assert_eq!(ColorMode::TrueColor.fg(c), "\x1b[38;2;195;62;88m");
+        assert_eq!(ColorMode::Ansi256.bg(c), "\x1b[48;5;131m");
+        assert_eq!(ColorMode::None.paint("x", c), "x");
+        assert_eq!(ColorMode::None.tint("x", c), "x");
+        assert_eq!(ColorMode::Ansi256.tint("x", c), "\x1b[38;5;131mx\x1b[0m");
+    }
 }

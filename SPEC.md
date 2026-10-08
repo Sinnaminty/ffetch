@@ -60,9 +60,10 @@ Status: Draft · 2026-10-08 · Takes ffetch from 0.1.0 to 0.2.0
 **Behavior**
 
 - `ffetch --image PATH` uses PATH as the logo instead of the embedded image. Config key: `logo.image`.
-- It runs the same pipeline as `build.rs` today: decode, remove the background, downsample to 256 px. It also downsamples to at most 1024 px **before** removing the background, so large photos stay fast.
+- It runs the same pipeline as `build.rs` today: decode, remove the background, downsample to 256 px. Images larger than 2048 px are first shrunk to at most 1024 px **before** background removal, so large photos stay fast. (Smaller images skip this step so the default logo's output doesn't change.)
 - `--keep-background` (config `logo.keep_background`) skips background removal, for images where the background is part of the picture.
-- The processed buffer is cached at `${XDG_CACHE_HOME:-~/.cache}/ffetch/images/<key>.rgba`. The key hashes the canonical path, file size and mtime. The cache file has a small header with width, height and the removed background color.
+- The processed buffer is cached at `${XDG_CACHE_HOME:-~/.cache}/ffetch/images/<key>.rgba`. The key is an FNV-1a hash of the canonical path, file size, mtime, `--keep-background`, the crate version and a format marker. The cache file has a small header with width, height and the removed background color.
+- Images over 64 megapixels are refused with the usual single warning, so a crafted file can't exhaust memory.
 - If the image fails to load, ffetch prints one warning line to stderr, uses the embedded logo, and exits 0. A broken image must never break someone's shell startup.
 - Only PNG is supported in this phase.
 
@@ -85,14 +86,14 @@ Status: Draft · 2026-10-08 · Takes ffetch from 0.1.0 to 0.2.0
 - Algorithm: k-means in Oklab, k = 6, k-means++ initialization with a fixed seed, 10 iterations. Drop clusters holding less than 2% of the pixels. The fixed seed satisfies R4.
 - Assign three theme roles:
   - `accent`: labels and the user name. Use the removed background color if there was one (this is today's behavior); otherwise the cluster with the highest chroma × weight among clusters with lightness between 0.35 and 0.80.
-  - `secondary`: the host name and bar fill. The most chromatic remaining cluster that differs from `accent` by ΔE_ok > 0.15.
   - `muted`: the separator line and the `@`. The cluster with the lowest chroma among clusters with lightness between 0.4 and 0.8.
-- Role colors are adjusted for the terminal background (`theme.background = "dark" | "light"`, default dark). Dark backgrounds get the same lightness lift the logo uses; light backgrounds get the mirror-image darkening.
+  - `secondary`: the host name and bar fill. The **most common** cluster with lightness ≥ 0.35 that is more than ΔE_ok 0.15 from `accent` and more than 0.05 from `muted`; if none qualifies, the accent. (The first draft picked the most chromatic cluster, but on the reference image that was a near-black, which made the host name unreadable.)
+- Role colors are adjusted for the terminal background (`theme.background = "dark" | "light"`, default dark). On a dark background, a color with HSL lightness below 0.45 is raised to 0.45; on a light background, one above 0.55 is lowered to 0.55. Every other color stays exactly as it is in the image.
 - Overrides: `theme.accent`, `theme.secondary` and `theme.muted` accept `#rrggbb`.
 
 **Acceptance**
 
-- For `assets/logo.png`, `accent` is `#C33E58` and the palette contains colors close to cream `#F2D7C5`, rose-beige `#C9A69D`, dark mauve `#473D46` and maroon `#633540`. Assert with ΔE_ok < 0.05.
+- For `assets/logo.png`, `accent` is `#C33E58`; the palette contains colors close to cream `#F2D7C5`, rose-beige `#C9A69D` and dark mauve `#473D46` (ΔE_ok < 0.05); `secondary` is the cream and `muted` the rose-beige. (Maroon `#633540` was also listed originally, but k-means merges it into dark mauve for every seed and sample size tried, so it was dropped.)
 - Running twice on the same image gives an identical palette.
 
 #### F1.3 Themed output and swatches
