@@ -1,0 +1,23 @@
+#
+#	List of PCI ID's (trimmed for the ffetch wsl2 fixture)
+#
+#	Version: 2024.03.31
+#
+
+# Syntax:
+# vendor  vendor_name
+#	device  device_name				<-- single tab
+#		subvendor subdevice  subsystem_name	<-- two tabs
+
+0001  SafeNet (wrong ID)
+1414  Microsoft Corporation
+	0001  MN-120 (ADMtek Centaur-C based)
+	0002  MN-130 (ADMtek Centaur-P based)
+# Virtual Video Card Device for Windows Remote Desktop (RDP)
+	008c  Basic Render Driver
+	008e  Basic Render Driver
+	5353  Hyper-V virtual VGA
+1415  Oxford Semiconductor Ltd
+1af4  Red Hat, Inc.
+	1043  Virtio 1.0 console
+	105a  Virtio file system

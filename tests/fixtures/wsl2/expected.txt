@@ -1,0 +1,16 @@
+dev@DEVBOX
+----------
+OS: Ubuntu 24.04.5 LTS x86_64
+Host: Windows Subsystem for Linux 2.6.3.0 (Ubuntu)
+Windows: Windows 11 (build 26300)
+Kernel: 6.6.87.2-microsoft-standard-WSL2
+Uptime: 6 hours, 5 mins
+Packages: 6 (dpkg)
+Shell: zsh 5.9
+Terminal: tmux
+CPU: 11th Gen Intel Core i7-11850H (16) @ 2.50GHz
+GPU: NVIDIA T1200 Laptop GPU
+Memory: 2.59 GiB / 15.48 GiB (16%)
+Disk (/): 79.37 GiB / 1006.85 GiB (8%)
+Battery: 100% [Full]
+Locale: C.UTF-8

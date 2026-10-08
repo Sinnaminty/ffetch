@@ -1,0 +1,14 @@
+#
+#	List of PCI ID's (trimmed for the ffetch arch-desktop fixture)
+#
+
+0001  SafeNet (wrong ID)
+1002  Advanced Micro Devices, Inc. [AMD/ATI]
+	164e  Raphael
+	744c  Navi 31 [Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M]
+1022  Advanced Micro Devices, Inc. [AMD]
+	1100  K8 [Athlon64/Opteron] HyperTransport Technology Configuration
+10de  NVIDIA Corporation
+	22ba  AD102 High Definition Audio Controller
+	2684  AD102 [GeForce RTX 4090]
+		1043 889d  ROG Strix GeForce RTX 4090

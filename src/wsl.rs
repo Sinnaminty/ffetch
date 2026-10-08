@@ -1,9 +1,9 @@
 //! WSL detection, and facts about the Windows side, found by running Windows
 //! programs through WSL interop.
 
-use std::{env, fs, process::Command, sync::OnceLock};
+use std::{path::Path, process::Command};
 
-use crate::command;
+use crate::info::{Ctx, System};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wsl {
@@ -15,19 +15,20 @@ pub enum Wsl {
 const NVIDIA_SMI: &str = "/usr/lib/wsl/lib/nvidia-smi";
 /// The first Windows 11 build; Windows 11 still reports version 10.0.
 const WINDOWS_11_BUILD: u32 = 22000;
+/// Set by WSL to the distribution's name, e.g. "Ubuntu".
+const DISTRO: &str = "WSL_DISTRO_NAME";
 
-/// The WSL version, or `None` outside WSL. Detected once per run.
-pub fn current() -> Option<Wsl> {
-    static CURRENT: OnceLock<Option<Wsl>> = OnceLock::new();
-    *CURRENT.get_or_init(|| {
-        let release = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-        detect(&release, distro().is_some())
-    })
+/// The WSL version of `sys`, or `None` outside WSL.
+pub fn detect(sys: &dyn System) -> Option<Wsl> {
+    let release = sys
+        .read(Path::new("/proc/sys/kernel/osrelease"))
+        .unwrap_or_default();
+    classify(&release, sys.env(DISTRO).is_some_and(|d| !d.is_empty()))
 }
 
 /// WSL kernels say so in their release ("6.6.87.2-microsoft-standard-WSL2"),
 /// and WSL sets `WSL_DISTRO_NAME` even with a custom kernel.
-fn detect(release: &str, distro_set: bool) -> Option<Wsl> {
+fn classify(release: &str, distro_set: bool) -> Option<Wsl> {
     let release = release.to_lowercase();
     (release.contains("microsoft") || distro_set).then(|| match release.contains("wsl2") {
         true => Wsl::V2,
@@ -35,18 +36,15 @@ fn detect(release: &str, distro_set: bool) -> Option<Wsl> {
     })
 }
 
-fn distro() -> Option<String> {
-    env::var("WSL_DISTRO_NAME").ok().filter(|d| !d.is_empty())
-}
-
 /// "Windows Subsystem for Linux 2.6.3.0 (Ubuntu)", or `None` without a
 /// working `wslinfo`. Fast enough (~1 ms) not to need caching.
-pub fn host() -> Option<String> {
+pub fn host(ctx: &Ctx) -> Option<String> {
     let mut wslinfo = Command::new("wslinfo");
     wslinfo.arg("--version");
-    let out = command::run(wslinfo).filter(|o| o.status.success())?;
+    let out = ctx.run(wslinfo).filter(|o| o.status.success())?;
     let out = String::from_utf8_lossy(&out.stdout);
-    Some(host_name(wslinfo_version(&out)?, distro().as_deref()))
+    let distro = ctx.env_nonempty(DISTRO);
+    Some(host_name(wslinfo_version(&out)?, distro.as_deref()))
 }
 
 fn host_name(version: &str, distro: Option<&str>) -> String {
@@ -67,11 +65,11 @@ fn wslinfo_version(out: &str) -> Option<&str> {
 }
 
 /// "Windows 11 (build 26300)", from `cmd.exe /c ver` (~130 ms).
-pub fn windows() -> Option<String> {
+pub fn windows(ctx: &Ctx) -> Option<String> {
     let mut cmd = Command::new("cmd.exe");
     // Started from a Linux directory, cmd.exe warns that UNC paths are not supported.
     cmd.args(["/c", "ver"]).current_dir("/mnt/c");
-    let out = command::run(cmd).filter(|o| o.status.success())?;
+    let out = ctx.run(cmd).filter(|o| o.status.success())?;
     windows_version(&String::from_utf8_lossy(&out.stdout))
 }
 
@@ -97,7 +95,7 @@ fn windows_version(ver: &str) -> Option<String> {
 
 /// The physical GPUs, one per line. WSL's own PCI bus only has a virtual
 /// adapter, so ask the NVIDIA driver (~120 ms), or else Windows (~700 ms).
-pub fn gpus() -> Option<String> {
+pub fn gpus(ctx: &Ctx) -> Option<String> {
     let mut nvidia_smi = Command::new(NVIDIA_SMI);
     nvidia_smi.args(["--query-gpu=name", "--format=csv,noheader"]);
     let mut powershell = Command::new("powershell.exe");
@@ -108,7 +106,7 @@ pub fn gpus() -> Option<String> {
         "(Get-CimInstance Win32_VideoController).Name",
     ]);
     [nvidia_smi, powershell].into_iter().find_map(|cmd| {
-        let out = command::run(cmd).filter(|o| o.status.success())?;
+        let out = ctx.run(cmd).filter(|o| o.status.success())?;
         gpu_names(&String::from_utf8_lossy(&out.stdout))
     })
 }
@@ -144,7 +142,7 @@ mod tests {
         ];
         for (release, distro_set, expected) in cases {
             assert_eq!(
-                detect(release, distro_set),
+                classify(release, distro_set),
                 expected,
                 "{release:?}, {distro_set}"
             );

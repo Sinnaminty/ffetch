@@ -135,9 +135,6 @@ fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     result
 }
 
-/// Changes on every boot, including a `wsl --shutdown` or a Windows reboot.
-const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
-
 /// Fact name -> value; `None` records a lookup that found nothing.
 type FactMap = BTreeMap<String, Option<String>>;
 
@@ -158,14 +155,10 @@ pub struct Facts {
 }
 
 impl Facts {
-    /// The facts cached for the current boot. With `refresh`, each fact is
-    /// computed again (and the result saved).
-    pub fn load(refresh: bool) -> Facts {
-        let boot_id = fs::read_to_string(BOOT_ID).ok();
-        Facts::open(dir().map(|d| d.join("facts.json")), boot_id, refresh)
-    }
-
-    fn open(file: Option<PathBuf>, boot_id: Option<String>, refresh: bool) -> Facts {
+    /// The facts cached in `file` for the boot `boot_id` (the contents of
+    /// `/proc/sys/kernel/random/boot_id`). With `refresh`, each fact is
+    /// computed again (and the result saved). Without a file nothing is kept.
+    pub fn open(file: Option<PathBuf>, boot_id: Option<String>, refresh: bool) -> Facts {
         // Without a boot ID there's no telling when a fact goes stale, so
         // nothing is cached.
         let boot_id = boot_id

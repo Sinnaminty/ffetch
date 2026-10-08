@@ -1,0 +1,4 @@
+program: /usr/bin/zsh
+arg: --version
+---
+zsh 5.9 (x86_64-ubuntu-linux-gnu)

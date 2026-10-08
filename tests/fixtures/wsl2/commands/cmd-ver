@@ -1,0 +1,7 @@
+program: cmd.exe
+arg: /c
+arg: ver
+cwd: /mnt/c
+---
+
+Microsoft Windows [Version 10.0.26300.9457]

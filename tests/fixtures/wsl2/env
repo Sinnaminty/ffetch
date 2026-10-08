@@ -1,0 +1,13 @@
+# The environment ffetch sees, one KEY=VALUE per line.
+USER=dev
+HOME=/home/dev
+SHELL=/usr/bin/zsh
+LANG=C.UTF-8
+TERM=tmux-256color
+TERM_PROGRAM=tmux
+TMUX=/tmp/tmux-1000/default,1266,0
+COLORTERM=truecolor
+DISPLAY=:0
+WAYLAND_DISPLAY=wayland-0
+WSL_DISTRO_NAME=Ubuntu
+WSL_INTEROP=/run/WSL/423_interop

@@ -140,16 +140,18 @@ fn main() {
     let palette = palette::extract(&image.pixels, image.background);
     let roles = Theme::default().roles(&palette);
     let swatches = swatch_rows(args.swatches, &palette, mode);
-    let sys = info::collect(args.refresh);
+    let ctx = info::Ctx::live(args.refresh);
+    let sys = info::collect(&ctx, &info::default_modules());
+    let fields = sys.fields();
     let term = term::size();
 
-    let info_cols = natural_info_width(&sys, &swatches);
+    let info_cols = natural_info_width(&sys, &fields, &swatches);
     let logo_cols = args
         .logo
         .and_then(|_| fit_logo(&image, args.size, info_cols, term));
     let max_info_cols = term.map(|(w, _)| w.saturating_sub(logo_cols.map_or(0, |c| c + GAP)));
 
-    let info = info_lines(&sys, mode, roles, &swatches, max_info_cols);
+    let info = info_lines(&sys, &fields, mode, roles, &swatches, max_info_cols);
     let logo = match (args.logo, logo_cols) {
         (Some(style), Some(cols)) => image.render(style, cols, mode),
         _ => Vec::new(),
@@ -217,10 +219,13 @@ fn fit_logo(
     (cols >= MIN_LOGO_COLS).then_some(cols)
 }
 
-fn natural_info_width(sys: &info::System, swatches: &[Vec<String>]) -> usize {
+fn natural_info_width(
+    sys: &info::Info,
+    fields: &[(&str, String)],
+    swatches: &[Vec<String>],
+) -> usize {
     let title = sys.user.chars().count() + 1 + sys.host.chars().count();
-    let fields = sys
-        .fields
+    let fields = fields
         .iter()
         .map(|(label, value)| label.len() + 2 + value.chars().count());
     let swatches = swatches.iter().map(|row| row.len() * SWATCH_COLS);
@@ -245,8 +250,11 @@ fn swatch_rows(kind: Swatches, palette: &Palette, mode: ColorMode) -> Vec<Vec<St
     rows
 }
 
+/// The info column: the title, then a "Label: value" line per field (`fields`
+/// from `Info::fields`), then the swatch rows.
 fn info_lines(
-    sys: &info::System,
+    sys: &info::Info,
+    fields: &[(&str, String)],
     mode: ColorMode,
     roles: Roles,
     swatches: &[Vec<String>],
@@ -263,7 +271,7 @@ fn info_lines(
         mode.tint(&"-".repeat(title_len), roles.muted),
     ];
 
-    for (label, value) in &sys.fields {
+    for (label, value) in fields {
         let room = max_cols.map(|m| m.saturating_sub(label.len() + 2));
         lines.push(format!(
             "{}: {}",

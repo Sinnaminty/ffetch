@@ -1,0 +1,18 @@
+ada@archbox
+-----------
+OS: Arch Linux x86_64
+Host: MS-7D75 1.0
+Kernel: 6.10.10-arch1-1
+Uptime: 11 days, 13 hours, 46 mins
+Packages: 7 (pacman), 3 (flatpak)
+Shell: bash 5.2.37
+Resolution: 2560x1440, 1920x1080
+DE: KDE
+WM: KWin
+Terminal: kitty
+CPU: AMD Ryzen 9 7950X (32) @ 5.88GHz
+GPU: NVIDIA GeForce RTX 4090
+GPU: AMD Raphael
+Memory: 10.44 GiB / 61.93 GiB (16%)
+Disk (/): 359.31 GiB / 931.51 GiB (40%)
+Locale: en_US.UTF-8
