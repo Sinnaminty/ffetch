@@ -1,0 +1,6 @@
+# Addresses as getifaddrs lists them: interface, address, flags.
+lo        127.0.0.1                  up,running,loopback
+enp5s0    192.168.1.20               up,running
+docker0   172.17.0.1                 up,running
+lo        ::1                        up,running,loopback
+enp5s0    fe80::4a2a:e3ff:fe5c:9b10  up,running

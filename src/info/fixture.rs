@@ -3,14 +3,15 @@
 
 use std::{
     collections::BTreeMap,
-    fs,
+    env, fs,
     os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Output},
+    process::{self, Command, ExitStatus, Output},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
-use super::ctx::{Entry, Statvfs, System, Uname, list_dir};
+use super::ctx::{Ctx, Entry, IfAddr, Statvfs, System, Uname, list_dir};
 
 /// A canned program run: its argv (and working directory, if it matters) and
 /// what it printed.
@@ -21,12 +22,23 @@ pub struct Canned {
     stdout: Vec<u8>,
 }
 
+/// A canned exchange over a Unix socket: the request's first line and the
+/// reply.
+pub struct CannedSocket {
+    path: PathBuf,
+    request: String,
+    reply: Vec<u8>,
+}
+
 pub struct Fixture {
     root: PathBuf,
     pub env: BTreeMap<String, String>,
     uname: Uname,
     statvfs: BTreeMap<PathBuf, Statvfs>,
     pub commands: Vec<Canned>,
+    pub sockets: Vec<CannedSocket>,
+    pub interfaces: Vec<IfAddr>,
+    pub cwd: Option<PathBuf>,
     pub ppid: u32,
     pub uid: u32,
     /// Every path read, in order (shared, so it can be checked after the
@@ -58,36 +70,80 @@ fn number<T: std::str::FromStr>(key: &str, value: &str) -> T {
 }
 
 impl Fixture {
+    /// A machine with the filesystem at `root` and nothing else: no
+    /// environment, programs, sockets or network.
+    pub fn bare(root: PathBuf) -> Fixture {
+        Fixture {
+            root,
+            env: BTreeMap::new(),
+            uname: Uname::default(),
+            statvfs: BTreeMap::new(),
+            commands: Vec::new(),
+            sockets: Vec::new(),
+            interfaces: Vec::new(),
+            cwd: None,
+            ppid: 1,
+            uid: 1000,
+            reads: Arc::default(),
+        }
+    }
+
     pub fn load(name: &str) -> Fixture {
         let dir = dir(name);
         assert!(dir.is_dir(), "no fixture {}", dir.display());
+        let mut fixture = Fixture::bare(dir.join("root"));
         let file = |f: &str| fs::read_to_string(dir.join(f)).unwrap_or_default();
 
-        let env = pairs(&file("env"))
+        fixture.env = pairs(&file("env"))
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
 
-        let mut uname = Uname::default();
         for (key, value) in pairs(&file("uname")) {
             let field = match key {
-                "nodename" => &mut uname.nodename,
-                "release" => &mut uname.release,
-                "machine" => &mut uname.machine,
+                "nodename" => &mut fixture.uname.nodename,
+                "release" => &mut fixture.uname.release,
+                "machine" => &mut fixture.uname.machine,
                 _ => panic!("uname: unknown key {key:?}"),
             };
             *field = value.to_string();
         }
 
-        let (mut ppid, mut uid) = (1, 1000);
         for (key, value) in pairs(&file("process")) {
             match key {
-                "ppid" => ppid = number(key, value),
-                "uid" => uid = number(key, value),
+                "ppid" => fixture.ppid = number(key, value),
+                "uid" => fixture.uid = number(key, value),
+                "cwd" => fixture.cwd = Some(value.into()),
                 _ => panic!("process: unknown key {key:?}"),
             }
         }
 
-        let mut statvfs = BTreeMap::new();
+        for line in file("interfaces").lines() {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let &[name, addr, flags] = words.as_slice() else {
+                assert!(
+                    words.is_empty() || words[0].starts_with('#'),
+                    "interfaces: {line:?}"
+                );
+                continue;
+            };
+            let flags: Vec<&str> = flags.split(',').collect();
+            for flag in &flags {
+                assert!(
+                    ["up", "running", "loopback", "-"].contains(flag),
+                    "interfaces: {flag:?}"
+                );
+            }
+            fixture.interfaces.push(IfAddr {
+                name: name.into(),
+                addr: addr
+                    .parse()
+                    .unwrap_or_else(|_| panic!("interfaces: {addr:?}")),
+                up: flags.contains(&"up"),
+                running: flags.contains(&"running"),
+                loopback: flags.contains(&"loopback"),
+            });
+        }
+
         for line in file("statvfs").lines() {
             let mut words = line.split_whitespace();
             let Some(path) = words.next().filter(|w| !w.starts_with('#')) else {
@@ -109,28 +165,27 @@ impl Fixture {
                 };
                 *field = number(key, value);
             }
-            statvfs.insert(PathBuf::from(path), st);
+            fixture.statvfs.insert(PathBuf::from(path), st);
         }
 
-        let mut commands = Vec::new();
-        let mut files: Vec<PathBuf> = fs::read_dir(dir.join("commands"))
-            .map(|d| d.map(|e| e.unwrap().path()).collect())
-            .unwrap_or_default();
-        files.sort();
-        for path in files {
-            commands.push(canned(&fs::read(&path).unwrap(), &path));
+        let files = |sub: &str| {
+            let mut files: Vec<PathBuf> = fs::read_dir(dir.join(sub))
+                .map(|d| d.map(|e| e.unwrap().path()).collect())
+                .unwrap_or_default();
+            files.sort();
+            files
+        };
+        for path in files("commands") {
+            fixture
+                .commands
+                .push(canned(&fs::read(&path).unwrap(), &path));
         }
-
-        Fixture {
-            root: dir.join("root"),
-            env,
-            uname,
-            statvfs,
-            commands,
-            ppid,
-            uid,
-            reads: Arc::default(),
+        for path in files("sockets") {
+            fixture
+                .sockets
+                .push(canned_socket(&fs::read(&path).unwrap(), &path));
         }
+        fixture
     }
 
     /// Where the absolute `path` is in the fixture's tree.
@@ -139,25 +194,38 @@ impl Fixture {
     }
 }
 
-/// Parses a canned command: header lines (`program:`, then `arg:` for each
-/// argument, and optional `cwd:` and `status:`), a `---` line, then stdout.
-fn canned(data: &[u8], path: &Path) -> Canned {
+/// Splits a canned file into its header, as `key: value` pairs (`#` comment
+/// lines skipped), and the bytes after the `---` line.
+fn canned_parts<'a>(data: &'a [u8], path: &Path) -> (Vec<(&'a str, &'a str)>, &'a [u8]) {
     let split = data
         .windows(5)
         .position(|w| w == b"\n---\n")
         .unwrap_or_else(|| panic!("{}: no --- line", path.display()));
     let header = std::str::from_utf8(&data[..split]).expect("UTF-8 header");
+    let pairs = header
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|line| {
+            let (key, value) = line
+                .split_once(':')
+                .unwrap_or_else(|| panic!("{}: expected key: value", path.display()));
+            (key, value.strip_prefix(' ').unwrap_or(value))
+        })
+        .collect();
+    (pairs, &data[split + 5..])
+}
+
+/// Parses a canned command: header lines (`program:`, then `arg:` for each
+/// argument, and optional `cwd:` and `status:`), a `---` line, then stdout.
+fn canned(data: &[u8], path: &Path) -> Canned {
+    let (header, stdout) = canned_parts(data, path);
     let mut c = Canned {
         argv: Vec::new(),
         cwd: None,
         status: 0,
-        stdout: data[split + 5..].to_vec(),
+        stdout: stdout.to_vec(),
     };
-    for line in header.lines().filter(|l| !l.starts_with('#')) {
-        let (key, value) = line
-            .split_once(':')
-            .unwrap_or_else(|| panic!("{}: expected key: value", path.display()));
-        let value = value.strip_prefix(' ').unwrap_or(value);
+    for (key, value) in header {
         match key {
             "program" => c.argv.insert(0, value.to_string()),
             "arg" => c.argv.push(value.to_string()),
@@ -167,6 +235,56 @@ fn canned(data: &[u8], path: &Path) -> Canned {
         }
     }
     c
+}
+
+/// Parses a canned socket exchange: `path:` and `request:` (the request's first
+/// line) header lines, a `---` line, then the reply.
+fn canned_socket(data: &[u8], path: &Path) -> CannedSocket {
+    let (header, reply) = canned_parts(data, path);
+    let get = |key: &str| {
+        let (_, value) = header
+            .iter()
+            .find(|(k, _)| *k == key)
+            .unwrap_or_else(|| panic!("{}: no {key}:", path.display()));
+        value.to_string()
+    };
+    CannedSocket {
+        path: get("path").into(),
+        request: get("request"),
+        reply: reply.to_vec(),
+    }
+}
+
+/// A directory tree written for one test, and deleted when dropped.
+pub struct Tree {
+    root: PathBuf,
+}
+
+impl Tree {
+    /// Writes `files` ((absolute path, contents) pairs) under a fresh directory
+    /// named after the test.
+    pub fn new(test: &str, files: &[(&str, &str)]) -> Tree {
+        let root = env::temp_dir().join(format!("ffetch-test-{}-{test}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        for (path, contents) in files {
+            let path = root.join(path.strip_prefix('/').unwrap_or(path));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        Tree { root }
+    }
+
+    /// A context for a machine with only these files (see `Fixture::bare`).
+    pub fn ctx(&self) -> Ctx {
+        Ctx::new(Box::new(Fixture::bare(self.root.clone())), None, false)
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
 }
 
 impl System for Fixture {
@@ -187,6 +305,10 @@ impl System for Fixture {
         self.env.get(key).cloned()
     }
 
+    fn cwd(&self) -> Option<PathBuf> {
+        self.cwd.clone()
+    }
+
     fn uname(&self) -> Uname {
         self.uname.clone()
     }
@@ -195,9 +317,14 @@ impl System for Fixture {
         self.statvfs.get(path).copied()
     }
 
+    fn interfaces(&self) -> Vec<IfAddr> {
+        self.interfaces.clone()
+    }
+
     /// The canned output with the same argv (and working directory, if the
-    /// canned one names it); like a missing program otherwise.
-    fn run(&self, cmd: Command) -> Option<Output> {
+    /// canned one names it); like a missing program otherwise. Canned programs
+    /// never time out.
+    fn run(&self, cmd: Command, _timeout: Duration) -> Option<Output> {
         let argv: Vec<_> = [cmd.get_program()]
             .into_iter()
             .chain(cmd.get_args())
@@ -216,6 +343,17 @@ impl System for Fixture {
             stdout: c.stdout.clone(),
             stderr: Vec::new(),
         })
+    }
+
+    /// The canned reply for this socket and request line; like a missing
+    /// socket otherwise.
+    fn unix_request(&self, path: &Path, request: &[u8], _timeout: Duration) -> Option<Vec<u8>> {
+        let line = request.split(|&b| b == b'\r' || b == b'\n').next()?;
+        let canned = self
+            .sockets
+            .iter()
+            .find(|s| s.path == path && s.request.as_bytes() == line)?;
+        Some(canned.reply.clone())
     }
 
     fn ppid(&self) -> u32 {
@@ -239,11 +377,10 @@ impl System for Fixture {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, process};
-
     use super::*;
     use crate::{
-        info::{Ctx, Info, Report, Value, collect, default_modules, value::Field},
+        info::{Info, Report, Value, collect, default_modules, value::Field},
+        layout::{self, Layout, Options},
         palette::Roles,
         term::{ColorMode, Rgb},
     };
@@ -259,13 +396,26 @@ mod tests {
     /// The info column as `--no-color` prints it.
     fn plain_text(info: &Info) -> String {
         let gray = Rgb(128, 128, 128);
-        let roles = Roles {
-            accent: gray,
-            secondary: gray,
-            muted: gray,
+        let opts = Options {
+            logo: None,
+            size: None,
+            layout: Layout::Auto,
+            bars: true,
+            mode: ColorMode::None,
+            roles: Roles {
+                accent: gray,
+                secondary: gray,
+                muted: gray,
+            },
+            swatches: Vec::new(),
         };
-        let lines = crate::info_lines(info, &info.fields(), ColorMode::None, roles, &[], None);
+        let lines = layout::info_lines(info, &info.rows(), &opts, None);
         lines.join("\n") + "\n"
+    }
+
+    /// (label, text) for each line of the info column.
+    fn lines(info: &Info) -> Vec<(&'static str, String)> {
+        info.rows().into_iter().map(|r| (r.label, r.text)).collect()
     }
 
     /// Compares `actual` with the fixture's `expected.txt`, or rewrites that
@@ -348,6 +498,14 @@ mod tests {
         assert_eq!(field(&info, "battery", "pct"), int(100));
         assert_eq!(field(&info, "battery", "status"), text("Full"));
         assert_eq!(field(&info, "locale", "name"), text("C.UTF-8"));
+        assert_eq!(field(&info, "load", "load1"), Some(Field::Float(0.14)));
+        assert_eq!(field(&info, "load", "load15"), Some(Field::Float(0.08)));
+        assert_eq!(field(&info, "load", "threads"), int(16));
+        assert!(info.get("temp").is_none(), "WSL has no CPU sensors");
+        assert_eq!(field(&info, "git", "branch"), text("main"));
+        assert_eq!(field(&info, "git", "ahead"), int(0));
+        assert_eq!(field(&info, "git", "behind"), int(0));
+        assert_eq!(field(&info, "git", "changed"), int(0));
     }
 
     #[test]
@@ -374,6 +532,115 @@ mod tests {
             panic!("no GPU");
         };
         assert_eq!(gpus.names, ["NVIDIA GeForce RTX 4090", "AMD Raphael"]);
+        assert_eq!(field(&info, "temp", "celsius"), Some(Field::Float(54.125)));
+        assert_eq!(field(&info, "load", "load1"), Some(Field::Float(2.31)));
+        assert_eq!(field(&info, "load", "threads"), int(32));
+        assert_eq!(field(&info, "git", "ahead"), int(1));
+        assert_eq!(field(&info, "git", "behind"), int(0));
+        assert_eq!(field(&info, "git", "changed"), int(3));
+    }
+
+    const OPT_IN: [&str; 4] = ["toolchains", "docker", "ip", "updates"];
+
+    #[test]
+    fn opt_in_modules_on_wsl2() {
+        let info = collect(&ctx(Fixture::load("wsl2")), &OPT_IN);
+        assert_eq!(
+            lines(&info),
+            [
+                ("Toolchains", "python 3.12.3".to_string()),
+                ("Local IP", "172.20.254.26 (eth0)".to_string()),
+                ("Updates", "15 (5 security)".to_string()),
+            ],
+            "no Docker socket"
+        );
+        assert_eq!(field(&info, "toolchains", "python"), text("3.12.3"));
+        assert_eq!(field(&info, "ip", "interface"), text("eth0"));
+        assert_eq!(field(&info, "updates", "total"), int(15));
+        assert_eq!(field(&info, "updates", "security"), int(5));
+    }
+
+    #[test]
+    fn opt_in_modules_on_arch_desktop() {
+        let info = collect(&ctx(Fixture::load("arch-desktop")), &OPT_IN);
+        assert_eq!(
+            lines(&info),
+            [
+                (
+                    "Toolchains",
+                    "rust 1.98.1 · node 22.11.0 · python 3.12.7".to_string()
+                ),
+                ("Containers", "3 running".to_string()),
+                ("Local IP", "192.168.1.20 (enp5s0)".to_string()),
+            ],
+            "no update-notifier on Arch"
+        );
+        assert_eq!(field(&info, "toolchains", "count"), int(3));
+        assert_eq!(field(&info, "docker", "running"), int(3));
+        assert_eq!(field(&info, "ip", "address"), text("192.168.1.20"));
+    }
+
+    #[test]
+    fn docker_errors_hide_the_module() {
+        let mut fixture = Fixture::load("arch-desktop");
+        fixture.sockets[0].reply =
+            b"HTTP/1.0 403 Forbidden\r\nContent-Type: application/json\r\n\r\n{}".to_vec();
+        assert!(collect(&ctx(fixture), &["docker"]).modules.is_empty());
+
+        let mut fixture = Fixture::load("arch-desktop");
+        fixture.sockets.clear();
+        assert!(collect(&ctx(fixture), &["docker"]).modules.is_empty());
+    }
+
+    #[test]
+    fn git_is_only_shown_inside_a_repository() {
+        // git fails outside a repository: here, no canned run for that directory.
+        let mut fixture = Fixture::load("arch-desktop");
+        fixture.cwd = Some("/home/ada".into());
+        assert!(collect(&ctx(fixture), &["git"]).modules.is_empty());
+
+        let mut fixture = Fixture::load("arch-desktop");
+        fixture.cwd = None;
+        assert!(collect(&ctx(fixture), &["git"]).modules.is_empty());
+
+        // A failing run (not a repository after all) is hidden too.
+        let mut fixture = Fixture::load("wsl2");
+        let git = fixture
+            .commands
+            .iter_mut()
+            .find(|c| c.argv[0] == "git")
+            .unwrap();
+        git.status = 128;
+        assert!(collect(&ctx(fixture), &["git"]).modules.is_empty());
+    }
+
+    #[test]
+    fn each_battery_gets_a_bar() {
+        let tree = Tree::new(
+            "two-batteries",
+            &[
+                ("/sys/class/power_supply/AC/type", "Mains\n"),
+                ("/sys/class/power_supply/BAT0/type", "Battery\n"),
+                ("/sys/class/power_supply/BAT0/capacity", "80\n"),
+                ("/sys/class/power_supply/BAT0/status", "Charging\n"),
+                ("/sys/class/power_supply/BAT1/type", "Battery\n"),
+                ("/sys/class/power_supply/BAT1/capacity", "9\n"),
+            ],
+        );
+        let info = collect(&tree.ctx(), &["battery", "kernel"]);
+        let rows: Vec<(String, Option<u64>)> = info
+            .rows()
+            .into_iter()
+            .map(|r| (r.text, r.meter.map(|m| m.pct)))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("80% [Charging]".to_string(), Some(80)),
+                ("9%".to_string(), Some(9)),
+            ],
+            "no kernel without uname"
+        );
     }
 
     #[test]
@@ -381,7 +648,7 @@ mod tests {
         let mut fixture = Fixture::load("wsl2");
         fixture.commands.clear();
         let info = collect(&ctx(fixture), &default_modules());
-        let fields = info.fields();
+        let fields = lines(&info);
         let get = |label| {
             fields
                 .iter()
@@ -413,7 +680,7 @@ mod tests {
         .unwrap();
         let ctx = Ctx::new(Box::new(Fixture::load("wsl2")), Some(file.clone()), false);
         let info = collect(&ctx, &["windows", "gpu"]);
-        let fields = info.fields();
+        let fields = lines(&info);
         assert_eq!(fields[0], ("Windows", "Windows 99 (build 1)".to_string()));
         // A cached "nothing found" falls back to the PCI scan without asking again.
         assert_eq!(
@@ -487,12 +754,12 @@ mod tests {
         let mut fixture = Fixture::load("arch-desktop");
         fixture.ppid = 2150;
         let info = collect(&ctx(fixture), &["terminal"]);
-        assert_eq!(info.fields(), [("Terminal", "kitty".to_string())]);
+        assert_eq!(lines(&info), [("Terminal", "kitty".to_string())]);
 
         // No parent to walk (e.g. started by init): $TERM is all there is.
         let mut fixture = Fixture::load("arch-desktop");
         fixture.ppid = 1;
         let info = collect(&ctx(fixture), &["terminal"]);
-        assert_eq!(info.fields(), [("Terminal", "xterm-kitty".to_string())]);
+        assert_eq!(lines(&info), [("Terminal", "xterm-kitty".to_string())]);
     }
 }

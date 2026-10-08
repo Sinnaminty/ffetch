@@ -1,0 +1,10 @@
+
+Expanded Security Maintenance for Applications is not enabled.
+
+15 updates can be applied immediately.
+5 of these updates are standard security updates.
+To see these additional updates run: apt list --upgradable
+
+3 additional security updates can be applied with ESM Apps.
+Learn more about enabling ESM Apps service at https://ubuntu.com/esm
+

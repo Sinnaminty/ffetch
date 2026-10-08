@@ -2,7 +2,7 @@
 //! after its label and which named fields it exposes (for quips and `--format`).
 //! The types are plain structs so they can derive `Serialize` for `--json`.
 
-use std::fmt;
+use std::{fmt, net::Ipv4Addr};
 
 /// What every module value can do.
 pub trait Report {
@@ -12,19 +12,53 @@ pub trait Report {
 
     /// The field `name`, e.g. `pct` of `memory`. `None` for a field the value
     /// doesn't have (or doesn't know, such as an unknown clock speed).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "for quips (M5) and --format (M6)")
-    )]
     fn field(&self, name: &str) -> Option<Field>;
+
+    /// What a usage bar before the text measures; the bar shows the `pct`
+    /// field. `None` for values shown without one.
+    fn gauge(&self) -> Option<Gauge> {
+        None
+    }
+}
+
+/// What a usage bar measures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gauge {
+    /// Memory or disk space in use: the more, the worse.
+    Used,
+    /// Battery charge: the less, the worse.
+    Charge,
+}
+
+/// How worrying a usage bar's percentage is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    Ok,
+    Warn,
+    Crit,
+}
+
+/// A percentage shown as a usage bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Meter {
+    pub gauge: Gauge,
+    pub pct: u64,
+}
+
+impl Meter {
+    /// In use: ok below 60%, warn up to 85%, crit above. A charge is the other
+    /// way round: ok above 40%, warn down to 15%, crit below.
+    pub fn level(self) -> Level {
+        match (self.gauge, self.pct) {
+            (Gauge::Used, 0..60) | (Gauge::Charge, 41..) => Level::Ok,
+            (Gauge::Used, 60..=85) | (Gauge::Charge, 15..=40) => Level::Warn,
+            _ => Level::Crit,
+        }
+    }
 }
 
 /// A named field of a module value.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "for quips (M5) and --format (M6)")
-)]
 pub enum Field {
     Int(u64),
     Float(f64),
@@ -56,11 +90,18 @@ pub enum Value {
     Wm(Name),
     Terminal(Name),
     Cpu(Cpu),
+    Temp(Temp),
+    Load(Load),
     Gpu(Gpus),
     Memory(Usage),
     Disk(Usage),
     Battery(Batteries),
+    Git(Git),
     Locale(Name),
+    Toolchains(Toolchains),
+    Docker(Containers),
+    Ip(LocalIp),
+    Updates(Updates),
 }
 
 impl Value {
@@ -76,9 +117,25 @@ impl Value {
             Value::Shell(v) => v,
             Value::Resolution(v) => v,
             Value::Cpu(v) => v,
+            Value::Temp(v) => v,
+            Value::Load(v) => v,
             Value::Gpu(v) => v,
             Value::Memory(v) | Value::Disk(v) => v,
             Value::Battery(v) => v,
+            Value::Git(v) => v,
+            Value::Toolchains(v) => v,
+            Value::Docker(v) => v,
+            Value::Ip(v) => v,
+            Value::Updates(v) => v,
+        }
+    }
+
+    /// The value in the pieces that get a usage bar each: one per battery, or
+    /// else the whole value.
+    pub fn parts(&self) -> Vec<&dyn Report> {
+        match self {
+            Value::Battery(b) => b.batteries.iter().map(|b| b as &dyn Report).collect(),
+            v => vec![v.report()],
         }
     }
 }
@@ -90,6 +147,10 @@ impl Report for Value {
 
     fn field(&self, name: &str) -> Option<Field> {
         self.report().field(name)
+    }
+
+    fn gauge(&self) -> Option<Gauge> {
+        self.report().gauge()
     }
 }
 
@@ -427,6 +488,10 @@ impl Report for Usage {
             _ => None,
         }
     }
+
+    fn gauge(&self) -> Option<Gauge> {
+        Some(Gauge::Used)
+    }
 }
 
 fn human_size(bytes: u64) -> String {
@@ -453,25 +518,231 @@ pub struct Battery {
 }
 
 impl Report for Batteries {
+    /// A line per battery.
     fn display(&self) -> String {
-        let lines: Vec<String> = self
-            .batteries
-            .iter()
-            .map(|b| match &b.status {
-                Some(status) => format!("{}% [{status}]", b.pct),
-                None => format!("{}%", b.pct),
-            })
-            .collect();
+        let lines: Vec<String> = self.batteries.iter().map(Battery::display).collect();
         lines.join("\n")
     }
 
     /// The first battery's `pct` and `status`.
     fn field(&self, name: &str) -> Option<Field> {
-        let first = self.batteries.first()?;
         match name {
-            "pct" => int(first.pct),
-            "status" => text(first.status.as_deref()?),
             "count" => int(self.batteries.len()),
+            _ => self.batteries.first()?.field(name),
+        }
+    }
+}
+
+impl Report for Battery {
+    fn display(&self) -> String {
+        match &self.status {
+            Some(status) => format!("{}% [{status}]", self.pct),
+            None => format!("{}%", self.pct),
+        }
+    }
+
+    fn field(&self, name: &str) -> Option<Field> {
+        match name {
+            "pct" => int(self.pct),
+            "status" => text(self.status.as_deref()?),
+            _ => None,
+        }
+    }
+
+    fn gauge(&self) -> Option<Gauge> {
+        Some(Gauge::Charge)
+    }
+}
+
+/// The CPU temperature.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Temp {
+    pub celsius: f64,
+}
+
+impl Report for Temp {
+    /// "54°C"
+    fn display(&self) -> String {
+        format!("{}°C", self.celsius.round())
+    }
+
+    fn field(&self, name: &str) -> Option<Field> {
+        match name {
+            "celsius" => Some(Field::Float(self.celsius)),
+            _ => None,
+        }
+    }
+}
+
+/// The load average: runnable and waiting tasks over 1, 5 and 15 minutes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Load {
+    pub load1: f64,
+    pub load5: f64,
+    pub load15: f64,
+    /// Logical CPUs, for scale; 0 if unknown.
+    pub threads: usize,
+}
+
+impl Report for Load {
+    /// "0.14, 0.15, 0.08 (16 threads)"
+    fn display(&self) -> String {
+        let averages = format!("{:.2}, {:.2}, {:.2}", self.load1, self.load5, self.load15);
+        match self.threads {
+            0 => averages,
+            1 => format!("{averages} (1 thread)"),
+            n => format!("{averages} ({n} threads)"),
+        }
+    }
+
+    fn field(&self, name: &str) -> Option<Field> {
+        match name {
+            "load1" => Some(Field::Float(self.load1)),
+            "load5" => Some(Field::Float(self.load5)),
+            "load15" => Some(Field::Float(self.load15)),
+            "threads" if self.threads > 0 => int(self.threads),
+            _ => None,
+        }
+    }
+}
+
+/// The git status of the working directory.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Git {
+    /// The branch, or the short commit ID when the HEAD is detached.
+    pub branch: String,
+    /// Commits ahead of and behind the upstream branch, if there is one.
+    pub ahead_behind: Option<(u64, u64)>,
+    /// Files with changes, staged or not, including untracked ones.
+    pub changed: u64,
+}
+
+impl Report for Git {
+    /// "main ↑1 ↓0, 3 changed" or "main, clean". The arrows only show when the
+    /// branch and its upstream differ.
+    fn display(&self) -> String {
+        let mut out = self.branch.clone();
+        if let Some((ahead, behind)) = self.ahead_behind
+            && (ahead, behind) != (0, 0)
+        {
+            out += &format!(" ↑{ahead} ↓{behind}");
+        }
+        match self.changed {
+            0 => out + ", clean",
+            n => out + &format!(", {n} changed"),
+        }
+    }
+
+    fn field(&self, name: &str) -> Option<Field> {
+        match name {
+            "branch" => text(&self.branch),
+            "ahead" => int(self.ahead_behind?.0),
+            "behind" => int(self.ahead_behind?.1),
+            "changed" => int(self.changed),
+            _ => None,
+        }
+    }
+}
+
+/// The installed toolchains that answered `--version`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Toolchains {
+    pub tools: Vec<Tool>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tool {
+    /// "rust", "node" or "python".
+    pub name: &'static str,
+    /// e.g. "1.98.1".
+    pub version: String,
+}
+
+impl Report for Toolchains {
+    /// "rust 1.98.1 · node 22.11.0 · python 3.12.3"
+    fn display(&self) -> String {
+        let tools: Vec<String> = self
+            .tools
+            .iter()
+            .map(|t| format!("{} {}", t.name, t.version))
+            .collect();
+        tools.join(" · ")
+    }
+
+    /// `count`, or the version of one toolchain by its name, e.g. `rust`.
+    fn field(&self, name: &str) -> Option<Field> {
+        if name == "count" {
+            return int(self.tools.len());
+        }
+        text(&self.tools.iter().find(|t| t.name == name)?.version)
+    }
+}
+
+/// Docker's running containers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Containers {
+    pub running: usize,
+}
+
+impl Report for Containers {
+    /// "3 running"
+    fn display(&self) -> String {
+        format!("{} running", self.running)
+    }
+
+    fn field(&self, name: &str) -> Option<Field> {
+        match name {
+            "running" => int(self.running),
+            _ => None,
+        }
+    }
+}
+
+/// The machine's address on the local network.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalIp {
+    pub address: Ipv4Addr,
+    /// e.g. "eth0".
+    pub interface: String,
+}
+
+impl Report for LocalIp {
+    /// "192.168.1.20 (eth0)"
+    fn display(&self) -> String {
+        format!("{} ({})", self.address, self.interface)
+    }
+
+    fn field(&self, name: &str) -> Option<Field> {
+        match name {
+            "address" => text(&self.address.to_string()),
+            "interface" => text(&self.interface),
+            _ => None,
+        }
+    }
+}
+
+/// Pending package updates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Updates {
+    pub total: u64,
+    /// How many of them are security updates.
+    pub security: u64,
+}
+
+impl Report for Updates {
+    /// "15 (5 security)", "15", or "up to date".
+    fn display(&self) -> String {
+        match (self.total, self.security) {
+            (0, _) => "up to date".into(),
+            (total, 0) => total.to_string(),
+            (total, security) => format!("{total} ({security} security)"),
+        }
+    }
+
+    fn field(&self, name: &str) -> Option<Field> {
+        match name {
+            "total" => int(self.total),
+            "security" => int(self.security),
             _ => None,
         }
     }
@@ -553,5 +824,129 @@ mod tests {
         assert_eq!(p.field("total"), int(10usize));
         assert_eq!(p.field("flatpak"), int(3usize));
         assert_eq!(p.field("dpkg"), None);
+    }
+
+    #[test]
+    fn meter_levels() {
+        let level = |gauge, pct| Meter { gauge, pct }.level();
+        for (pct, used, charge) in [
+            (0, Level::Ok, Level::Crit),
+            (14, Level::Ok, Level::Crit),
+            (15, Level::Ok, Level::Warn),
+            (40, Level::Ok, Level::Warn),
+            (41, Level::Ok, Level::Ok),
+            (59, Level::Ok, Level::Ok),
+            (60, Level::Warn, Level::Ok),
+            (85, Level::Warn, Level::Ok),
+            (86, Level::Crit, Level::Ok),
+            (100, Level::Crit, Level::Ok),
+        ] {
+            assert_eq!(level(Gauge::Used, pct), used, "{pct}% used");
+            assert_eq!(level(Gauge::Charge, pct), charge, "{pct}% charged");
+        }
+    }
+
+    #[test]
+    fn each_battery_is_a_part_with_a_gauge() {
+        let battery = |pct, status: Option<&str>| Battery {
+            pct,
+            status: status.map(str::to_string),
+        };
+        let value = Value::Battery(Batteries {
+            batteries: vec![battery(80, Some("Charging")), battery(12, None)],
+        });
+        assert_eq!(value.display(), "80% [Charging]\n12%");
+        assert_eq!(value.gauge(), None, "the parts have the bars");
+        assert_eq!(value.field("pct"), int(80u64));
+        assert_eq!(value.field("count"), int(2usize));
+        let parts = value.parts();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1].display(), "12%");
+        assert_eq!(parts[1].field("pct"), int(12u64));
+        assert_eq!(parts[1].gauge(), Some(Gauge::Charge));
+
+        let memory = Value::Memory(Usage::new(1, 2, 2));
+        assert_eq!(memory.parts().len(), 1);
+        assert_eq!(memory.gauge(), Some(Gauge::Used));
+        assert_eq!(
+            Value::Kernel(Kernel {
+                release: "6.1".into()
+            })
+            .gauge(),
+            None
+        );
+    }
+
+    #[test]
+    fn load_formatting() {
+        let load = |threads| Load {
+            load1: 0.14,
+            load5: 0.155,
+            load15: 12.0,
+            threads,
+        };
+        assert_eq!(load(16).display(), "0.14, 0.15, 12.00 (16 threads)");
+        assert_eq!(load(1).display(), "0.14, 0.15, 12.00 (1 thread)");
+        assert_eq!(load(0).display(), "0.14, 0.15, 12.00");
+        assert_eq!(load(16).field("load1"), Some(Field::Float(0.14)));
+        assert_eq!(load(16).field("threads"), int(16usize));
+        assert_eq!(load(0).field("threads"), None, "unknown, not zero");
+    }
+
+    #[test]
+    fn temp_formatting() {
+        let temp = |celsius| Temp { celsius }.display();
+        assert_eq!(temp(54.125), "54°C");
+        assert_eq!(temp(54.5), "55°C");
+        assert_eq!(temp(100.0), "100°C");
+    }
+
+    #[test]
+    fn git_formatting() {
+        let git = |ahead_behind, changed| Git {
+            branch: "main".into(),
+            ahead_behind,
+            changed,
+        };
+        assert_eq!(git(Some((1, 0)), 3).display(), "main ↑1 ↓0, 3 changed");
+        assert_eq!(git(Some((0, 2)), 0).display(), "main ↑0 ↓2, clean");
+        assert_eq!(git(Some((0, 0)), 0).display(), "main, clean");
+        assert_eq!(git(None, 1).display(), "main, 1 changed");
+        assert_eq!(git(Some((0, 0)), 0).field("ahead"), int(0u64));
+        assert_eq!(git(None, 0).field("behind"), None);
+        assert_eq!(git(None, 4).field("changed"), int(4u64));
+    }
+
+    #[test]
+    fn small_module_formatting() {
+        let tools = Toolchains {
+            tools: vec![
+                Tool {
+                    name: "rust",
+                    version: "1.98.1".into(),
+                },
+                Tool {
+                    name: "python",
+                    version: "3.12.3".into(),
+                },
+            ],
+        };
+        assert_eq!(tools.display(), "rust 1.98.1 · python 3.12.3");
+        assert_eq!(tools.field("python"), text("3.12.3"));
+        assert_eq!(tools.field("node"), None);
+        assert_eq!(tools.field("count"), int(2usize));
+
+        let updates = |total, security| Updates { total, security }.display();
+        assert_eq!(updates(15, 5), "15 (5 security)");
+        assert_eq!(updates(1, 0), "1");
+        assert_eq!(updates(0, 0), "up to date");
+
+        assert_eq!(Containers { running: 3 }.display(), "3 running");
+        let ip = LocalIp {
+            address: Ipv4Addr::new(192, 168, 1, 20),
+            interface: "eth0".into(),
+        };
+        assert_eq!(ip.display(), "192.168.1.20 (eth0)");
+        assert_eq!(ip.field("address"), text("192.168.1.20"));
     }
 }

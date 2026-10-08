@@ -2,8 +2,10 @@ mod cache;
 mod command;
 mod image;
 mod info;
+mod layout;
 mod logo;
 mod palette;
+mod socket;
 mod term;
 mod wsl;
 
@@ -13,18 +15,10 @@ use std::{
     process::exit,
 };
 
+use layout::{Layout, MIN_LOGO_COLS, Options, Swatches};
 use logo::{LogoImage, Style};
-use palette::{Palette, Roles, Theme};
-use term::{ColorMode, RESET};
-
-/// Spaces between the logo and the info column.
-const GAP: usize = 3;
-const DEFAULT_LOGO_COLS: usize = 48;
-const MIN_LOGO_COLS: usize = 16;
-/// The info column is truncated down to this before the logo is dropped entirely.
-const MIN_INFO_COLS: usize = 32;
-/// Width of one colour swatch at the bottom of the info column.
-const SWATCH_COLS: usize = 3;
+use palette::Theme;
+use term::ColorMode;
 
 const HELP: &str = "\
 ffetch - a neofetch-style system info tool
@@ -36,22 +30,16 @@ Options:
   -s, --size <cols>      Logo width in columns (default 48; shrinks to fit the terminal)
       --image <path>     Use a PNG image as the logo and take the colors from it
       --keep-background  With --image, keep the image's background instead of removing it
+      --layout <kind>    Logo placement: auto (default; beside the info if it fits,
+                         else above it), side, stacked
+      --modules <ids>    Show these modules, in this order, e.g. os,load,git,ip
       --swatches <kind>  Color swatches: palette (default), ansi, none
+      --no-bars          Hide the usage bars of memory, disk and battery
       --no-color         Disable colors (NO_COLOR is honored too)
       --refresh          Recompute the facts cached until the next boot
   -h, --help             Show this help
   -V, --version          Show the version
 ";
-
-/// What the swatch rows at the bottom of the info column show.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Swatches {
-    /// One row with the palette taken from the logo.
-    Palette,
-    /// Two rows with the 16 ANSI colors.
-    Ansi,
-    None,
-}
 
 struct Args {
     logo: Option<Style>,
@@ -59,7 +47,11 @@ struct Args {
     no_color: bool,
     image: Option<PathBuf>,
     keep_background: bool,
+    layout: Layout,
+    /// `--modules`: the module list, replacing the default one.
+    modules: Option<String>,
     swatches: Swatches,
+    bars: bool,
     /// Recompute the facts cached per boot.
     refresh: bool,
 }
@@ -71,7 +63,10 @@ fn parse_args() -> Result<Args, String> {
         no_color: false,
         image: None,
         keep_background: false,
+        layout: Layout::Auto,
+        modules: None,
         swatches: Swatches::Palette,
+        bars: true,
         refresh: false,
     };
     let mut argv = std::env::args().skip(1);
@@ -84,7 +79,7 @@ fn parse_args() -> Result<Args, String> {
         let mut value = || inline.clone().or_else(|| argv.next());
         match flag.as_str() {
             "-h" | "--help" => {
-                print!("{HELP}");
+                print!("{HELP}{}", module_help());
                 exit(0);
             }
             "-V" | "--version" => {
@@ -92,6 +87,7 @@ fn parse_args() -> Result<Args, String> {
                 exit(0);
             }
             "--no-color" => args.no_color = true,
+            "--no-bars" => args.bars = false,
             "-l" | "--logo" => {
                 args.logo = match value().as_deref() {
                     Some("ascii") => Some(Style::Ascii),
@@ -103,6 +99,17 @@ fn parse_args() -> Result<Args, String> {
             "--image" => args.image = Some(value().ok_or("--image expects a path")?.into()),
             "--keep-background" => args.keep_background = true,
             "--refresh" => args.refresh = true,
+            "--layout" => {
+                args.layout = match value().as_deref() {
+                    Some("auto") => Layout::Auto,
+                    Some("side") => Layout::Side,
+                    Some("stacked") => Layout::Stacked,
+                    v => return Err(expected("--layout", "auto, side or stacked", v)),
+                }
+            }
+            "--modules" => {
+                args.modules = Some(value().ok_or("--modules expects a list of module ids")?)
+            }
             "--swatches" => {
                 args.swatches = match value().as_deref() {
                     Some("palette") => Swatches::Palette,
@@ -124,6 +131,45 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
+/// The module ids for `--help`: the default ones in display order, then the
+/// others.
+fn module_help() -> String {
+    let ids = |default_on: bool| {
+        let ids: Vec<&str> = info::MODULES
+            .iter()
+            .filter(|m| m.default_on == default_on)
+            .map(|m| m.id)
+            .collect();
+        wrap(&ids)
+    };
+    format!(
+        "\nModules (for --modules), shown by default:\n{}Off by default:\n{}",
+        ids(true),
+        ids(false)
+    )
+}
+
+/// `words` separated by commas, in indented lines of at most 80 columns.
+fn wrap(words: &[&str]) -> String {
+    let mut lines = vec![String::new()];
+    for (i, word) in words.iter().enumerate() {
+        let word = match i + 1 < words.len() {
+            true => format!("{word},"),
+            false => word.to_string(),
+        };
+        let line = lines.last_mut().unwrap();
+        if !line.is_empty() && 2 + line.len() + 1 + word.len() > 80 {
+            lines.push(String::new());
+        }
+        let line = lines.last_mut().unwrap();
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        *line += &word;
+    }
+    lines.iter().map(|l| format!("  {l}\n")).collect()
+}
+
 /// Error for an option that takes one of a few words.
 fn expected(flag: &str, choices: &str, got: Option<&str>) -> String {
     let got = got.map_or("nothing".into(), |v| format!("'{v}'"));
@@ -136,46 +182,36 @@ fn main() {
         exit(2);
     });
     let mode = ColorMode::detect(args.no_color);
+    let ids = match &args.modules {
+        Some(list) => module_list(list),
+        None => info::default_modules(),
+    };
     let image = load_image(&args);
     let palette = palette::extract(&image.pixels, image.background);
-    let roles = Theme::default().roles(&palette);
-    let swatches = swatch_rows(args.swatches, &palette, mode);
-    let ctx = info::Ctx::live(args.refresh);
-    let sys = info::collect(&ctx, &info::default_modules());
-    let fields = sys.fields();
-    let term = term::size();
-
-    let info_cols = natural_info_width(&sys, &fields, &swatches);
-    let logo_cols = args
-        .logo
-        .and_then(|_| fit_logo(&image, args.size, info_cols, term));
-    let max_info_cols = term.map(|(w, _)| w.saturating_sub(logo_cols.map_or(0, |c| c + GAP)));
-
-    let info = info_lines(&sys, &fields, mode, roles, &swatches, max_info_cols);
-    let logo = match (args.logo, logo_cols) {
-        (Some(style), Some(cols)) => image.render(style, cols, mode),
-        _ => Vec::new(),
+    let opts = Options {
+        logo: args.logo,
+        size: args.size,
+        layout: args.layout,
+        bars: args.bars,
+        mode,
+        roles: Theme::default().roles(&palette),
+        swatches: layout::swatch_rows(args.swatches, &palette, mode),
     };
-
-    let mut out = String::new();
-    for i in 0..logo.len().max(info.len()) {
-        let line = info.get(i).map_or("", String::as_str);
-        if let Some(cols) = logo_cols {
-            match logo.get(i) {
-                Some(l) => out += l,
-                None if !line.is_empty() => out += &" ".repeat(cols),
-                None => {}
-            }
-            if !line.is_empty() {
-                out += &" ".repeat(GAP);
-            }
-        }
-        out += line;
-        out.push('\n');
-    }
-    out.push('\n');
+    let ctx = info::Ctx::live(args.refresh);
+    let sys = info::collect(&ctx, &ids);
+    let out = layout::render(&sys, &image, &opts, term::size());
     // Ignore errors such as a closed pipe (`ffetch | head`).
     let _ = io::stdout().lock().write_all(out.as_bytes());
+}
+
+/// The modules named in `--modules`, with a warning for each name that isn't
+/// one. They are skipped, so a typo never breaks a shell's startup.
+fn module_list(list: &str) -> Vec<&'static str> {
+    let (ids, unknown) = info::parse_list(list);
+    for name in unknown {
+        eprintln!("ffetch: unknown module '{name}'; skipping it");
+    }
+    ids
 }
 
 /// The logo image: `--image` if it loads, otherwise the embedded one. A broken
@@ -190,114 +226,5 @@ fn load_image(args: &Args) -> LogoImage {
             eprintln!("ffetch: can't load image {path:?}: {e}; using the built-in logo");
             LogoImage::embedded()
         }
-    }
-}
-
-/// Chooses the logo width: the requested (or default) size, shrunk so the logo
-/// and the info column fit the terminal. `None` means there is no room for it.
-fn fit_logo(
-    image: &LogoImage,
-    requested: Option<usize>,
-    info_cols: usize,
-    term: Option<(usize, usize)>,
-) -> Option<usize> {
-    let mut cols = requested.unwrap_or(DEFAULT_LOGO_COLS);
-    let Some((width, height)) = term else {
-        return Some(cols);
-    };
-
-    if requested.is_none() {
-        // Leave a row for the trailing blank line and one for the prompt.
-        cols = cols.min(image.cols_for(height.saturating_sub(2)));
-    }
-    // Shrink the logo first; only once it is at its minimum, squeeze the info.
-    let fits_full_info = width.saturating_sub(GAP + info_cols);
-    if cols > fits_full_info {
-        cols = fits_full_info.max(MIN_LOGO_COLS).min(cols);
-    }
-    cols = cols.min(width.saturating_sub(GAP + info_cols.min(MIN_INFO_COLS)));
-    (cols >= MIN_LOGO_COLS).then_some(cols)
-}
-
-fn natural_info_width(
-    sys: &info::Info,
-    fields: &[(&str, String)],
-    swatches: &[Vec<String>],
-) -> usize {
-    let title = sys.user.chars().count() + 1 + sys.host.chars().count();
-    let fields = fields
-        .iter()
-        .map(|(label, value)| label.len() + 2 + value.chars().count());
-    let swatches = swatches.iter().map(|row| row.len() * SWATCH_COLS);
-    fields.chain(swatches).chain([title]).max().unwrap_or(0)
-}
-
-/// Background colour codes for each swatch row. There are none without colour.
-fn swatch_rows(kind: Swatches, palette: &Palette, mode: ColorMode) -> Vec<Vec<String>> {
-    if mode == ColorMode::None {
-        return Vec::new();
-    }
-    let mut rows: Vec<Vec<String>> = match kind {
-        Swatches::Palette => vec![palette.colors.iter().map(|&c| mode.bg(c)).collect()],
-        Swatches::Ansi => vec![
-            (0..8).map(|i| format!("\x1b[4{i}m")).collect(),
-            (0..8).map(|i| format!("\x1b[10{i}m")).collect(),
-        ],
-        Swatches::None => Vec::new(),
-    };
-    // An image with no opaque pixels has an empty palette.
-    rows.retain(|r| !r.is_empty());
-    rows
-}
-
-/// The info column: the title, then a "Label: value" line per field (`fields`
-/// from `Info::fields`), then the swatch rows.
-fn info_lines(
-    sys: &info::Info,
-    fields: &[(&str, String)],
-    mode: ColorMode,
-    roles: Roles,
-    swatches: &[Vec<String>],
-    max_cols: Option<usize>,
-) -> Vec<String> {
-    let title_len = sys.user.chars().count() + 1 + sys.host.chars().count();
-    let mut lines = vec![
-        format!(
-            "{}{}{}",
-            mode.paint(&sys.user, roles.accent),
-            mode.tint("@", roles.muted),
-            mode.paint(&sys.host, roles.secondary)
-        ),
-        mode.tint(&"-".repeat(title_len), roles.muted),
-    ];
-
-    for (label, value) in fields {
-        let room = max_cols.map(|m| m.saturating_sub(label.len() + 2));
-        lines.push(format!(
-            "{}: {}",
-            mode.paint(label, roles.accent),
-            truncate(value, room)
-        ));
-    }
-
-    if !swatches.is_empty() {
-        lines.push(String::new());
-    }
-    let block = " ".repeat(SWATCH_COLS);
-    for row in swatches {
-        let row: String = row.iter().map(|code| format!("{code}{block}")).collect();
-        lines.push(row + RESET);
-    }
-    lines
-}
-
-fn truncate(s: &str, max: Option<usize>) -> String {
-    match max {
-        Some(max) if s.chars().count() > max => {
-            let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
-            t.push('…');
-            t
-        }
-        _ => s.to_string(),
     }
 }

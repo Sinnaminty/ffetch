@@ -1,0 +1,7 @@
+# Addresses as getifaddrs lists them: interface, address, flags.
+# WSL's DNS tunnel puts a private address on the loopback interface.
+lo        127.0.0.1                  up,running,loopback
+lo        10.255.255.254             up,running,loopback
+eth0      172.20.254.26              up,running
+lo        ::1                        up,running,loopback
+eth0      fe80::215:5dff:fe7a:1c2b   up,running

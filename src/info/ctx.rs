@@ -6,15 +6,17 @@ use std::{
     env,
     ffi::{CStr, CString, OsString},
     fs,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::OnceLock,
+    time::Duration,
 };
 
 use crate::{
     cache::{self, Facts},
-    command,
+    command, socket,
     wsl::{self, Wsl},
 };
 
@@ -30,10 +32,17 @@ pub trait System: Send + Sync {
     fn exists(&self, path: &Path) -> bool;
     /// The environment variable `key`. A value that isn't UTF-8 reads as empty.
     fn env(&self, key: &str) -> Option<String>;
+    /// The directory ffetch runs in.
+    fn cwd(&self) -> Option<PathBuf>;
     fn uname(&self) -> Uname;
     fn statvfs(&self, path: &Path) -> Option<Statvfs>;
-    /// Runs `cmd` like `command::run`: stdout captured, never hanging.
-    fn run(&self, cmd: Command) -> Option<Output>;
+    /// The IP addresses of the network interfaces, in `getifaddrs` order.
+    fn interfaces(&self) -> Vec<IfAddr>;
+    /// Runs `cmd` like `command::run`: stdout captured, killed after `timeout`.
+    fn run(&self, cmd: Command, timeout: Duration) -> Option<Output>;
+    /// Sends `request` to the Unix socket at `path` and returns the reply, like
+    /// `socket::request`; `None` if that fails or takes longer than `timeout`.
+    fn unix_request(&self, path: &Path, request: &[u8], timeout: Duration) -> Option<Vec<u8>>;
     /// The parent process of ffetch.
     fn ppid(&self) -> u32;
     /// ffetch's real user ID.
@@ -66,6 +75,19 @@ pub struct Statvfs {
     pub bfree: u64,
     /// Free blocks available to unprivileged users.
     pub bavail: u64,
+}
+
+/// An IP address of a network interface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IfAddr {
+    /// The interface, e.g. "eth0".
+    pub name: String,
+    pub addr: IpAddr,
+    /// Switched on (`IFF_UP`).
+    pub up: bool,
+    /// Connected (`IFF_RUNNING`): it has a carrier.
+    pub running: bool,
+    pub loopback: bool,
 }
 
 /// Lists a directory of the real filesystem.
@@ -101,6 +123,10 @@ impl System for Live {
         env::var_os(key).map(|v| v.into_string().unwrap_or_default())
     }
 
+    fn cwd(&self) -> Option<PathBuf> {
+        env::current_dir().ok()
+    }
+
     fn uname(&self) -> Uname {
         // SAFETY: uname only fills in the zeroed struct; its fields are NUL-terminated.
         let mut u: libc::utsname = unsafe { std::mem::zeroed() };
@@ -132,8 +158,43 @@ impl System for Live {
         })
     }
 
-    fn run(&self, cmd: Command) -> Option<Output> {
-        command::run(cmd)
+    fn interfaces(&self) -> Vec<IfAddr> {
+        let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+        // SAFETY: getifaddrs allocates the list, which is freed below and not
+        // used after that.
+        if unsafe { libc::getifaddrs(&mut list) } != 0 {
+            return Vec::new();
+        }
+        let mut addrs = Vec::new();
+        let mut next = list;
+        // SAFETY: each entry is null or valid until freeifaddrs; the names are
+        // NUL-terminated.
+        while let Some(ifa) = unsafe { next.as_ref() } {
+            next = ifa.ifa_next;
+            let Some(addr) = (unsafe { ip_addr(ifa.ifa_addr) }) else {
+                continue;
+            };
+            let flag = |f: libc::c_int| ifa.ifa_flags & f as libc::c_uint != 0;
+            addrs.push(IfAddr {
+                name: unsafe { CStr::from_ptr(ifa.ifa_name) }
+                    .to_string_lossy()
+                    .into_owned(),
+                addr,
+                up: flag(libc::IFF_UP),
+                running: flag(libc::IFF_RUNNING),
+                loopback: flag(libc::IFF_LOOPBACK),
+            });
+        }
+        unsafe { libc::freeifaddrs(list) };
+        addrs
+    }
+
+    fn run(&self, cmd: Command, timeout: Duration) -> Option<Output> {
+        command::run(cmd, timeout)
+    }
+
+    fn unix_request(&self, path: &Path, request: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+        socket::request(path, request, timeout)
     }
 
     fn ppid(&self) -> u32 {
@@ -156,6 +217,26 @@ impl System for Live {
                 .to_string_lossy()
                 .into_owned(),
         )
+    }
+}
+
+/// The IPv4 or IPv6 address in `sa`; `None` for other families.
+///
+/// SAFETY: `sa` is null or points to a socket address as big as its family's.
+unsafe fn ip_addr(sa: *const libc::sockaddr) -> Option<IpAddr> {
+    let family = unsafe { sa.as_ref() }?.sa_family as libc::c_int;
+    match family {
+        libc::AF_INET => {
+            let sin = unsafe { &*sa.cast::<libc::sockaddr_in>() };
+            // In network byte order, which is the order of the octets.
+            let octets = sin.sin_addr.s_addr.to_ne_bytes();
+            Some(IpAddr::V4(Ipv4Addr::from(octets)))
+        }
+        libc::AF_INET6 => {
+            let sin6 = unsafe { &*sa.cast::<libc::sockaddr_in6>() };
+            Some(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)))
+        }
+        _ => None,
     }
 }
 
@@ -274,9 +355,32 @@ impl Ctx {
         self.sys.statvfs(path.as_ref())
     }
 
-    /// Runs `cmd`; see `command::run`.
+    pub fn cwd(&self) -> Option<PathBuf> {
+        self.sys.cwd()
+    }
+
+    pub fn interfaces(&self) -> Vec<IfAddr> {
+        self.sys.interfaces()
+    }
+
+    /// Runs `cmd` with the usual timeout; see `command::run`.
     pub fn run(&self, cmd: Command) -> Option<Output> {
-        self.sys.run(cmd)
+        self.sys.run(cmd, command::TIMEOUT)
+    }
+
+    /// Runs `cmd`, killing it after `timeout`.
+    pub fn run_within(&self, cmd: Command, timeout: Duration) -> Option<Output> {
+        self.sys.run(cmd, timeout)
+    }
+
+    /// Sends `request` to the Unix socket at `path`; see `socket::request`.
+    pub fn unix_request(
+        &self,
+        path: impl AsRef<Path>,
+        request: &[u8],
+        timeout: Duration,
+    ) -> Option<Vec<u8>> {
+        self.sys.unix_request(path.as_ref(), request, timeout)
     }
 
     pub fn ppid(&self) -> u32 {

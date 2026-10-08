@@ -1,0 +1,14 @@
+program: git
+arg: --no-optional-locks
+arg: status
+arg: --porcelain=v2
+arg: --branch
+cwd: /home/ada/src/ffetch
+---
+# branch.oid 4f2a9c1e0b7d3a5f6e8c9d0a1b2c3d4e5f607182
+# branch.head main
+# branch.upstream origin/main
+# branch.ab +1 -0
+1 .M N... 100644 100644 100644 3b18e512dba79e4c8300dd08aeb37f8e728b8dad 3b18e512dba79e4c8300dd08aeb37f8e728b8dad src/main.rs
+1 A. N... 000000 100644 100644 0000000000000000000000000000000000000000 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 src/layout.rs
+? notes.txt

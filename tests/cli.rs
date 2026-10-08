@@ -175,6 +175,9 @@ fn bad_arguments_exit_2() {
         &["--swatches", "rainbow"][..],
         &["--swatches"],
         &["--image"],
+        &["--layout", "diagonal"],
+        &["--layout"],
+        &["--modules"],
         &["--bogus"],
     ] {
         let out = ffetch(&cache, args);
@@ -188,9 +191,116 @@ fn bad_arguments_exit_2() {
 fn help_lists_the_new_options() {
     let cache = temp_dir("help");
     let help = stdout(&ffetch(&cache, &["--help"]));
-    for option in ["--image", "--keep-background", "--swatches", "--refresh"] {
+    for option in [
+        "--image",
+        "--keep-background",
+        "--swatches",
+        "--refresh",
+        "--layout",
+        "--modules",
+        "--no-bars",
+    ] {
         assert!(help.contains(option), "{option} missing from --help");
     }
+    // The module ids, opt-in ones included.
+    for id in [
+        "os,",
+        "temp,",
+        "load,",
+        "git,",
+        "toolchains,",
+        "docker,",
+        "ip,",
+        "updates",
+    ] {
+        assert!(help.contains(id), "{id} missing from --help");
+    }
+    assert!(help.lines().all(|l| l.chars().count() <= 90), "{help}");
+}
+
+/// The info lines of a `--no-color --logo none` run with `args`.
+fn plain_lines(cache: &Path, args: &[&str]) -> (Output, Vec<String>) {
+    let mut all = vec!["--no-color", "--logo", "none"];
+    all.extend(args);
+    let out = ffetch(cache, &all);
+    let lines = stdout(&out).lines().map(str::to_string).collect();
+    (out, lines)
+}
+
+#[test]
+fn usage_bars_and_no_bars() {
+    let cache = temp_dir("bars");
+    let memory = |lines: &[String]| {
+        let line = lines.iter().find(|l| l.starts_with("Memory: ")).cloned();
+        line.expect("a Memory line")["Memory: ".len()..].to_string()
+    };
+    let (_, lines) = plain_lines(&cache, &[]);
+    let with_bar = memory(&lines);
+    let (bar, rest) = with_bar.split_at(12);
+    assert!(
+        bar.starts_with('[') && bar.ends_with(']') && bar[1..11].chars().all(|c| "#-".contains(c)),
+        "{with_bar:?}"
+    );
+    assert!(
+        rest.starts_with(' ') && rest.ends_with("%)"),
+        "{with_bar:?}"
+    );
+
+    let (out, lines) = plain_lines(&cache, &["--no-bars"]);
+    assert!(out.status.success());
+    assert!(memory(&lines).ends_with("%)") && !memory(&lines).contains('['));
+}
+
+#[test]
+fn modules_option_replaces_the_list_and_skips_unknown_ids() {
+    let cache = temp_dir("modules");
+    let (out, lines) = plain_lines(&cache, &["--modules", "kernel,bogus,os,nah,bogus,kernel"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        stderr_lines(&out),
+        [
+            "ffetch: unknown module 'bogus'; skipping it",
+            "ffetch: unknown module 'nah'; skipping it",
+        ]
+    );
+    let labels: Vec<&str> = lines[2..]
+        .iter()
+        .take_while(|l| !l.is_empty())
+        .map(|l| l.split(':').next().unwrap())
+        .collect();
+    assert_eq!(labels, ["Kernel", "OS"]);
+
+    // Opt-in modules can be asked for; ones with nothing to show are left out.
+    let (out, _) = plain_lines(&cache, &["--modules=updates,docker,load"]);
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty(), "{:?}", stderr_lines(&out));
+}
+
+#[test]
+fn stacked_layout_puts_the_logo_above_the_info() {
+    let cache = temp_dir("stacked");
+    let text = stdout(&ffetch(&cache, &["--no-color", "--layout", "stacked"]));
+    let lines: Vec<&str> = text.lines().collect();
+    let title = lines
+        .iter()
+        .position(|l| l.starts_with("OS: "))
+        .expect("an OS line at the left edge")
+        - 2;
+    // Not a terminal, so the logo keeps its default width: 48 columns, 24 rows,
+    // then a blank row.
+    assert_eq!(title, 25, "{text}");
+    assert!(lines[..24].iter().all(|l| l.chars().count() == 48));
+    assert!(lines[24].is_empty());
+    assert!(lines[title + 1].chars().all(|c| c == '-'));
+
+    // Side by side, auto's choice in a pipe. Only the logo columns are stable.
+    let logo_columns = |text: String| -> Vec<String> {
+        text.lines().map(|l| l.chars().take(48).collect()).collect()
+    };
+    let side = stdout(&ffetch(&cache, &["--no-color", "--layout", "side"]));
+    assert!(!side.lines().any(|l| l.starts_with("OS: ")));
+    let auto = stdout(&ffetch(&cache, &["--no-color", "--layout=auto"]));
+    assert_eq!(logo_columns(side), logo_columns(auto));
 }
 
 /// Whether this is WSL, by the same rule ffetch uses.

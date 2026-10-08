@@ -1,0 +1,4 @@
+program: python3
+arg: --version
+---
+Python 3.12.3

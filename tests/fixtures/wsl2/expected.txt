@@ -9,8 +9,10 @@ Packages: 6 (dpkg)
 Shell: zsh 5.9
 Terminal: tmux
 CPU: 11th Gen Intel Core i7-11850H (16) @ 2.50GHz
+Load: 0.14, 0.15, 0.08 (16 threads)
 GPU: NVIDIA T1200 Laptop GPU
-Memory: 2.59 GiB / 15.48 GiB (16%)
-Disk (/): 79.37 GiB / 1006.85 GiB (8%)
-Battery: 100% [Full]
+Memory: [##--------] 2.59 GiB / 15.48 GiB (16%)
+Disk (/): [#---------] 79.37 GiB / 1006.85 GiB (8%)
+Battery: [##########] 100% [Full]
+Git: main, clean
 Locale: C.UTF-8

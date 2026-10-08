@@ -1,8 +1,15 @@
-//! Modules about the hardware: host model, CPU, GPU, memory, disk and battery.
+//! Modules about the hardware and how busy it is: host model, CPU, CPU
+//! temperature, load, GPU, memory, disk, battery and local IP address.
+
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    path::Path,
+};
 
 use super::{
     Ctx,
-    value::{Batteries, Battery, Cpu, Gpus, Name, Usage, Value},
+    ctx::IfAddr,
+    value::{Batteries, Battery, Cpu, Gpus, Load, LocalIp, Name, Temp, Usage, Value},
 };
 use crate::wsl::{self, Wsl};
 
@@ -57,7 +64,7 @@ pub fn cpu(ctx: &Ctx) -> Option<Value> {
             (k.trim() == key).then(|| v.trim().to_string())
         })
     };
-    let threads = info.lines().filter(|l| l.starts_with("processor")).count();
+    let threads = cpu_threads(info);
     let raw = field("model name")
         .or_else(|| field("Hardware"))
         .or_else(|| field("cpu model"))?;
@@ -90,6 +97,62 @@ pub fn cpu(ctx: &Ctx) -> Option<Value> {
         .or(nominal)
         .or_else(|| field("cpu MHz")?.parse::<f64>().ok().map(|mhz| mhz / 1e3));
     Some(Value::Cpu(Cpu { name, threads, ghz }))
+}
+
+/// Logical CPUs: the entries in /proc/cpuinfo.
+fn cpu_threads(cpuinfo: &str) -> usize {
+    cpuinfo
+        .lines()
+        .filter(|l| l.starts_with("processor"))
+        .count()
+}
+
+/// hwmon drivers whose first sensor (`temp1`) is the CPU package or die.
+const CPU_SENSORS: &[&str] = &["coretemp", "k10temp", "zenpower"];
+
+pub fn temp(ctx: &Ctx) -> Option<Value> {
+    // Both report millidegrees Celsius.
+    let millidegrees = |path: &Path| ctx.read(path)?.parse::<f64>().ok();
+    let hwmon = || {
+        ctx.sorted_dir("/sys/class/hwmon")
+            .into_iter()
+            .filter(|p| {
+                ctx.read(p.join("name"))
+                    .is_some_and(|n| CPU_SENSORS.contains(&n.as_str()))
+            })
+            .find_map(|p| millidegrees(&p.join("temp1_input")))
+    };
+    // Intel CPUs without the coretemp driver, e.g. in some VMs.
+    let thermal_zone = || {
+        ctx.sorted_dir("/sys/class/thermal")
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("thermal_zone"))
+            })
+            .filter(|p| ctx.read(p.join("type")).as_deref() == Some("x86_pkg_temp"))
+            .find_map(|p| millidegrees(&p.join("temp")))
+    };
+    let millidegrees = hwmon().or_else(thermal_zone)?;
+    Some(Value::Temp(Temp {
+        celsius: millidegrees / 1000.0,
+    }))
+}
+
+pub fn load(ctx: &Ctx) -> Option<Value> {
+    let [load1, load5, load15] = loadavg(&ctx.read("/proc/loadavg")?)?;
+    Some(Value::Load(Load {
+        load1,
+        load5,
+        load15,
+        threads: ctx.cpuinfo().map_or(0, cpu_threads),
+    }))
+}
+
+/// The three averages in /proc/loadavg: "0.14 0.15 0.08 1/612 4242".
+fn loadavg(text: &str) -> Option<[f64; 3]> {
+    let mut words = text.split_whitespace().map(|w| w.parse().ok());
+    Some([words.next()??, words.next()??, words.next()??])
 }
 
 pub fn gpu(ctx: &Ctx) -> Option<Value> {
@@ -241,9 +304,26 @@ pub fn battery(ctx: &Ctx) -> Option<Value> {
     (!batteries.is_empty()).then_some(Value::Battery(Batteries { batteries }))
 }
 
+pub fn ip(ctx: &Ctx) -> Option<Value> {
+    let (interface, address) = local_ipv4(ctx.interfaces())?;
+    Some(Value::Ip(LocalIp { address, interface }))
+}
+
+/// The first IPv4 address that isn't loopback, on an interface that is up and
+/// connected.
+fn local_ipv4(addrs: Vec<IfAddr>) -> Option<(String, Ipv4Addr)> {
+    addrs.into_iter().find_map(|a| match a.addr {
+        IpAddr::V4(v4) if a.up && a.running && !a.loopback && !v4.is_loopback() => {
+            Some((a.name, v4))
+        }
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::info::fixture::Tree;
 
     const IDS: &str = "\
 # comment
@@ -283,5 +363,121 @@ mod tests {
         assert_eq!(gpu_name(Some(IDS), "1002", "164e"), "AMD Raphael");
         assert_eq!(gpu_name(Some(IDS), "1002", "1234"), "AMD Device 1234");
         assert_eq!(gpu_name(None, "abcd", "0001"), "abcd Device 0001");
+    }
+
+    #[test]
+    fn load_averages() {
+        assert_eq!(
+            loadavg("0.14 0.15 0.08 1/612 4242\n"),
+            Some([0.14, 0.15, 0.08])
+        );
+        assert_eq!(loadavg("12.50 7.00 3.25"), Some([12.5, 7.0, 3.25]));
+        assert_eq!(loadavg("0.14 0.15"), None);
+        assert_eq!(loadavg("0.14 x 0.08 1/612 4242"), None);
+        assert_eq!(
+            cpu_threads("processor\t: 0\nmodel name\t: x\n\nprocessor\t: 1\n"),
+            2
+        );
+    }
+
+    /// The CPU temperature found in a machine with only these files.
+    fn celsius_in(test: &str, files: &[(&str, &str)]) -> Option<f64> {
+        match temp(&Tree::new(test, files).ctx()) {
+            Some(Value::Temp(t)) => Some(t.celsius),
+            other => {
+                assert_eq!(other, None);
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn temperature_selection() {
+        let hwmon = |n: u32, name: &'static str, temp: &'static str| {
+            let dir = format!("/sys/class/hwmon/hwmon{n}");
+            [
+                (format!("{dir}/name"), format!("{name}\n")),
+                (format!("{dir}/temp1_input"), format!("{temp}\n")),
+            ]
+        };
+        let zone = |n: u32, kind: &'static str, temp: &'static str| {
+            let dir = format!("/sys/class/thermal/thermal_zone{n}");
+            [
+                (format!("{dir}/type"), format!("{kind}\n")),
+                (format!("{dir}/temp"), format!("{temp}\n")),
+            ]
+        };
+        let celsius = |test, files: Vec<[(String, String); 2]>| {
+            let files: Vec<(String, String)> = files.into_iter().flatten().collect();
+            let files: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(p, c)| (p.as_str(), c.as_str()))
+                .collect();
+            celsius_in(test, &files)
+        };
+
+        // Other sensors (a disk, a GPU) are skipped, whatever their order.
+        let amd = vec![
+            hwmon(0, "nvme", "38850"),
+            hwmon(1, "k10temp", "54125"),
+            hwmon(2, "amdgpu", "47000"),
+        ];
+        assert_eq!(celsius("temp-k10temp", amd), Some(54.125));
+        let intel = vec![hwmon(0, "acpitz", "27800"), hwmon(1, "coretemp", "61000")];
+        assert_eq!(celsius("temp-coretemp", intel), Some(61.0));
+        assert_eq!(
+            celsius("temp-zenpower", vec![hwmon(3, "zenpower", "48500")]),
+            Some(48.5)
+        );
+        // hwmon comes first; thermal zones are the fallback, by type.
+        let both = vec![
+            hwmon(0, "coretemp", "61000"),
+            zone(0, "x86_pkg_temp", "70000"),
+        ];
+        assert_eq!(celsius("temp-both", both), Some(61.0));
+        let zones = vec![
+            zone(0, "acpitz", "27800"),
+            zone(1, "x86_pkg_temp", "57000"),
+            hwmon(0, "BAT1", "30000"),
+        ];
+        assert_eq!(celsius("temp-zone", zones), Some(57.0));
+        // A CPU sensor that can't be read falls through to the next source.
+        let unreadable = vec![hwmon(0, "k10temp", "N/A"), zone(0, "x86_pkg_temp", "52000")];
+        assert_eq!(celsius("temp-unreadable", unreadable), Some(52.0));
+        // WSL: a battery and an AC adapter, and no thermal zones.
+        let wsl = vec![hwmon(0, "AC1", "0"), hwmon(1, "BAT1", "0")];
+        assert_eq!(celsius("temp-wsl", wsl), None);
+        assert_eq!(celsius("temp-none", vec![]), None);
+    }
+
+    #[test]
+    fn local_ip_selection() {
+        let addr = |name: &str, addr: &str, flags: &str| IfAddr {
+            name: name.into(),
+            addr: addr.parse().unwrap(),
+            up: flags.contains('u'),
+            running: flags.contains('r'),
+            loopback: flags.contains('l'),
+        };
+        let pick = |addrs: Vec<IfAddr>| local_ipv4(addrs).map(|(n, a)| format!("{a} ({n})"));
+        let wsl = vec![
+            addr("lo", "127.0.0.1", "url"),
+            // WSL's DNS tunnel puts a private address on the loopback.
+            addr("lo", "10.255.255.254", "url"),
+            addr("eth0", "fe80::215:5dff:fe12:3456", "ur"),
+            addr("eth0", "172.20.254.26", "ur"),
+        ];
+        assert_eq!(pick(wsl).as_deref(), Some("172.20.254.26 (eth0)"));
+        let desktop = vec![
+            addr("lo", "127.0.0.1", "url"),
+            // Switched off, and switched on but unplugged.
+            addr("enp4s0", "10.0.0.7", "r"),
+            addr("virbr0", "192.168.122.1", "u"),
+            addr("wlan0", "192.168.1.20", "ur"),
+            addr("docker0", "172.17.0.1", "ur"),
+        ];
+        assert_eq!(pick(desktop).as_deref(), Some("192.168.1.20 (wlan0)"));
+        assert_eq!(pick(vec![addr("lo", "127.0.0.1", "url")]), None);
+        assert_eq!(pick(vec![]), None);
     }
 }

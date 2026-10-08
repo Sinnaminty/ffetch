@@ -5,6 +5,7 @@
 
 mod ctx;
 mod desktop;
+mod dev;
 #[cfg(test)]
 mod fixture;
 mod hardware;
@@ -14,7 +15,9 @@ mod value;
 use std::thread;
 
 pub use ctx::{Ctx, System};
-pub use value::{Report, Value};
+#[cfg(test)]
+pub use value::Gauge;
+pub use value::{Field, Level, Meter, Report, Value};
 
 /// How expensive a module is to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +46,7 @@ pub struct ModuleDef {
     pub run: fn(&Ctx) -> Option<Value>,
 }
 
+/// A module that runs by default.
 const fn module(
     id: &'static str,
     label: &'static str,
@@ -58,7 +62,20 @@ const fn module(
     }
 }
 
-/// Every module, in the default display order.
+/// A module that only runs when asked for (`--modules`).
+const fn opt_in(
+    id: &'static str,
+    label: &'static str,
+    cost: Cost,
+    run: fn(&Ctx) -> Option<Value>,
+) -> ModuleDef {
+    ModuleDef {
+        default_on: false,
+        ..module(id, label, cost, run)
+    }
+}
+
+/// Every module: the default ones in display order, then the opt-in ones.
 pub static MODULES: &[ModuleDef] = &[
     module("os", "OS", Cost::Fast, software::os),
     // `wslinfo` on WSL, ~1 ms.
@@ -75,12 +92,22 @@ pub static MODULES: &[ModuleDef] = &[
     module("wm", "WM", Cost::Fast, desktop::wm),
     module("terminal", "Terminal", Cost::Fast, desktop::terminal),
     module("cpu", "CPU", Cost::Fast, hardware::cpu),
+    module("temp", "CPU Temp", Cost::Fast, hardware::temp),
+    module("load", "Load", Cost::Fast, hardware::load),
     // `nvidia-smi` or PowerShell on WSL, cached per boot.
     module("gpu", "GPU", Cost::Slow, hardware::gpu),
     module("memory", "Memory", Cost::Fast, hardware::memory),
     module("disk", "Disk (/)", Cost::Fast, hardware::disk),
     module("battery", "Battery", Cost::Fast, hardware::battery),
+    // `git status`, given 50 ms.
+    module("git", "Git", Cost::Spawn, dev::git),
     module("locale", "Locale", Cost::Fast, software::locale),
+    // rustc, node and python3, at once; 20-30 ms through rustup's proxy.
+    opt_in("toolchains", "Toolchains", Cost::Spawn, dev::toolchains),
+    opt_in("docker", "Containers", Cost::Fast, dev::docker),
+    // Off by default: people post screenshots.
+    opt_in("ip", "Local IP", Cost::Fast, hardware::ip),
+    opt_in("updates", "Updates", Cost::Fast, software::updates),
 ];
 
 /// The module with this id.
@@ -97,6 +124,29 @@ pub fn default_modules() -> Vec<&'static str> {
         .collect()
 }
 
+/// The modules named in `list` ("os,load,git"), in its order, and the names in
+/// it that aren't modules. Repeats and empty names are skipped.
+pub fn parse_list(list: &str) -> (Vec<&'static str>, Vec<&str>) {
+    let (mut ids, mut unknown) = (Vec::new(), Vec::new());
+    for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        match find(name) {
+            Some(def) if !ids.contains(&def.id) => ids.push(def.id),
+            None if !unknown.contains(&name) => unknown.push(name),
+            _ => {}
+        }
+    }
+    (ids, unknown)
+}
+
+/// One line of the info column.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Row {
+    pub label: &'static str,
+    pub text: String,
+    /// The usage bar before the text, for values that have one.
+    pub meter: Option<Meter>,
+}
+
 /// What `collect` found.
 pub struct Info {
     pub user: String,
@@ -106,19 +156,27 @@ pub struct Info {
 }
 
 impl Info {
-    /// (label, line) pairs in display order. A value with several lines (e.g.
-    /// several GPUs) gives one entry per line, each with the module's label.
-    pub fn fields(&self) -> Vec<(&'static str, String)> {
-        self.modules
-            .iter()
-            .flat_map(|(def, value)| {
-                value
-                    .display()
-                    .lines()
-                    .map(|l| (def.label, l.to_string()))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+    /// The info column's lines in display order. A value with several lines
+    /// (e.g. several GPUs) gives one row per line, each with the module's
+    /// label; each battery gets its own row and bar.
+    pub fn rows(&self) -> Vec<Row> {
+        let mut rows = Vec::new();
+        for (def, value) in &self.modules {
+            for part in value.parts() {
+                let meter = part.gauge().and_then(|gauge| match part.field("pct")? {
+                    Field::Int(pct) => Some(Meter { gauge, pct }),
+                    _ => None,
+                });
+                for (i, line) in part.display().lines().enumerate() {
+                    rows.push(Row {
+                        label: def.label,
+                        text: line.to_string(),
+                        meter: meter.filter(|_| i == 0),
+                    });
+                }
+            }
+        }
+        rows
     }
 
     /// The value of the module `id`, if it ran and had one.
@@ -160,7 +218,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_keeps_todays_order() {
+    fn registry_order_matches_the_spec() {
         let ids = default_modules();
         assert_eq!(
             ids,
@@ -177,10 +235,13 @@ mod tests {
                 "wm",
                 "terminal",
                 "cpu",
+                "temp",
+                "load",
                 "gpu",
                 "memory",
                 "disk",
                 "battery",
+                "git",
                 "locale"
             ]
         );
@@ -200,14 +261,51 @@ mod tests {
                 "WM",
                 "Terminal",
                 "CPU",
+                "CPU Temp",
+                "Load",
                 "GPU",
                 "Memory",
                 "Disk (/)",
                 "Battery",
+                "Git",
                 "Locale"
             ]
         );
         assert!(find("nope").is_none());
+    }
+
+    #[test]
+    fn opt_in_modules() {
+        let opt_in: Vec<(&str, &str)> = MODULES
+            .iter()
+            .filter(|m| !m.default_on)
+            .map(|m| (m.id, m.label))
+            .collect();
+        assert_eq!(
+            opt_in,
+            [
+                ("toolchains", "Toolchains"),
+                ("docker", "Containers"),
+                ("ip", "Local IP"),
+                ("updates", "Updates")
+            ]
+        );
+        let ids: Vec<&str> = MODULES.iter().map(|m| m.id).collect();
+        let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len(), "ids are unique");
+    }
+
+    #[test]
+    fn module_lists() {
+        assert_eq!(
+            parse_list("ip,os, load ,git"),
+            (vec!["ip", "os", "load", "git"], vec![])
+        );
+        assert_eq!(
+            parse_list("os,bogus,kernel,,nah,bogus,os"),
+            (vec!["os", "kernel"], vec!["bogus", "nah"])
+        );
+        assert_eq!(parse_list(""), (vec![], vec![]));
     }
 
     #[test]

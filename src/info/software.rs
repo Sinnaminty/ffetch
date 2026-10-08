@@ -1,11 +1,11 @@
 //! Modules about the installed system: OS, Windows (on WSL), kernel, uptime,
-//! packages, shell and locale.
+//! packages, shell, locale and pending updates.
 
 use std::{path::Path, process::Command};
 
 use super::{
     Ctx,
-    value::{Kernel, ManagerCount, Name, Os, Packages, Shell, Uptime, Value, Windows},
+    value::{Kernel, ManagerCount, Name, Os, Packages, Shell, Updates, Uptime, Value, Windows},
 };
 use crate::wsl;
 
@@ -146,4 +146,98 @@ pub fn locale(ctx: &Ctx) -> Option<Value> {
         .env_nonempty("LC_ALL")
         .or_else(|| ctx.env_nonempty("LANG"))?;
     Some(Value::Locale(Name::new(locale)))
+}
+
+/// Pending updates, as Ubuntu's update-notifier last counted them (for the
+/// login message). Package managers are too slow to ask.
+pub fn updates(ctx: &Ctx) -> Option<Value> {
+    let text = ctx.read("/var/lib/update-notifier/updates-available")?;
+    parse_updates(&text).map(Value::Updates)
+}
+
+/// Parses update-notifier's summary, e.g.
+///
+/// ```text
+/// 15 updates can be applied immediately.
+/// 5 of these updates are standard security updates.
+/// ```
+///
+/// or the older "15 packages can be updated. / 5 updates are security
+/// updates." The security count includes ESM updates that can be applied, but
+/// not the "additional" ones that would need ESM enabled. `None` for text in
+/// another form, e.g. another language.
+fn parse_updates(text: &str) -> Option<Updates> {
+    let (mut total, mut security) = (None, 0);
+    for line in text.lines() {
+        let line = line.trim();
+        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+        let Ok(n) = line[..digits].parse::<u64>() else {
+            continue;
+        };
+        let rest = &line[digits..];
+        if rest.contains("can be applied immediately") || rest.contains("can be updated") {
+            total.get_or_insert(n);
+        } else if rest.contains("security") && !rest.contains("additional") {
+            security += n;
+        }
+    }
+    Some(Updates {
+        total: total?,
+        security,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn updates(text: &str) -> Option<(u64, u64)> {
+        parse_updates(text).map(|u| (u.total, u.security))
+    }
+
+    #[test]
+    fn updates_available_plural_and_singular() {
+        let plural = "\n15 updates can be applied immediately.\n\
+            5 of these updates are standard security updates.\n\
+            To see these additional updates run: apt list --upgradable\n\n";
+        assert_eq!(updates(plural), Some((15, 5)));
+        let singular = "1 update can be applied immediately.\n\
+            1 of these updates is a standard security update.\n\
+            To see these additional updates run: apt list --upgradable\n";
+        assert_eq!(updates(singular), Some((1, 1)));
+        assert_eq!(
+            updates(
+                "2 updates can be applied immediately.\nTo see these additional updates run: apt list --upgradable\n"
+            ),
+            Some((2, 0))
+        );
+    }
+
+    #[test]
+    fn updates_available_with_esm_and_none() {
+        let esm = "Expanded Security Maintenance for Applications is enabled.\n\n\
+            7 updates can be applied immediately.\n\
+            2 of these updates are ESM Apps security updates.\n\
+            1 of these updates is a standard security update.\n\
+            To see these additional updates run: apt list --upgradable\n";
+        assert_eq!(updates(esm), Some((7, 3)));
+        let none = "Expanded Security Maintenance for Applications is not enabled.\n\n\
+            0 updates can be applied immediately.\n\n\
+            3 additional security updates can be applied with ESM Apps.\n\
+            Learn more about enabling ESM Apps service at https://ubuntu.com/esm\n";
+        assert_eq!(updates(none), Some((0, 0)));
+    }
+
+    #[test]
+    fn updates_available_older_format_and_garbage() {
+        let old = "15 packages can be updated.\n5 updates are security updates.\n";
+        assert_eq!(updates(old), Some((15, 5)));
+        let old_one = "1 package can be updated.\n1 update is a security update.\n";
+        assert_eq!(updates(old_one), Some((1, 1)));
+        assert_eq!(updates(""), None);
+        assert_eq!(
+            updates("15 Aktualisierungen können sofort angewendet werden.\n"),
+            None
+        );
+    }
 }

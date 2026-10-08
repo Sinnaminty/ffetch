@@ -46,7 +46,7 @@ Status: Draft · 2026-10-08 · Takes ffetch from 0.1.0 to 0.2.0
 |----|-------------|
 | R1 | **Performance budget.** A default run (warm cache) takes ≤ 25 ms wall time on the dev machine, measured with `hyperfine -N --warmup 3 ffetch`. Every module has a cost class (§5.2). A module in the `slow` class (> 50 ms) must be either cached (F2.5) or opt-in. |
 | R2 | **Silent degradation.** A module that can't determine its value is omitted. It never prints an error and never fails the run. |
-| R3 | **Color modes.** Every feature works in truecolor, 256-color and no-color modes. No-color output stays readable and uses ASCII fallbacks where Unicode glyphs carry meaning. |
+| R3 | **Color modes.** Every feature works in truecolor, 256-color and no-color modes. No-color output stays readable. Where a glyph's meaning depends on color (the usage bars), it gets an ASCII fallback. Other Unicode (`↑↓`, `°`, `·`, box drawing) is used as is. |
 | R4 | **Determinism.** The same image always produces the same logo and palette. Output is stable between runs except for live values (and the quip, F4). |
 | R5 | **Dependencies.** Each new crate needs a stated reason in its PR. Expected additions: `png` (moves from a build-only dependency to a runtime one, for F1.1), plus `serde`, `serde_json` and `toml` (F5). |
 | R6 | **Precedence.** CLI flags override the config file, and the config file overrides built-in defaults. |
@@ -87,7 +87,7 @@ Status: Draft · 2026-10-08 · Takes ffetch from 0.1.0 to 0.2.0
 - Assign three theme roles:
   - `accent`: labels and the user name. Use the removed background color if there was one (this is today's behavior); otherwise the cluster with the highest chroma × weight among clusters with lightness between 0.35 and 0.80.
   - `muted`: the separator line and the `@`. The cluster with the lowest chroma among clusters with lightness between 0.4 and 0.8.
-  - `secondary`: the host name and bar fill. The **most common** cluster with lightness ≥ 0.35 that is more than ΔE_ok 0.15 from `accent` and more than 0.05 from `muted`; if none qualifies, the accent. (The first draft picked the most chromatic cluster, but on the reference image that was a near-black, which made the host name unreadable.)
+  - `secondary`: the host name. The **most common** cluster with lightness ≥ 0.35 that is more than ΔE_ok 0.15 from `accent` and more than 0.05 from `muted`; if none qualifies, the accent. (The first draft picked the most chromatic cluster, but on the reference image that was a near-black, which made the host name unreadable.)
 - Role colors are adjusted for the terminal background (`theme.background = "dark" | "light"`, default dark). On a dark background, a color with HSL lightness below 0.45 is raised to 0.45; on a light background, one above 0.55 is lowered to 0.55. Every other color stays exactly as it is in the image.
 - Overrides: `theme.accent`, `theme.secondary` and `theme.muted` accept `#rrggbb`.
 
@@ -159,7 +159,7 @@ Measured on the dev machine:
 
 #### F3.1 Usage bars
 
-- Memory, Disk and Battery show a 10-cell bar right after the label: `Memory: ██░░░░░░░░ 1.86 GiB / 15.48 GiB (12%)`.
+- Memory, Disk and Battery show a 10-cell bar right after the label: `Memory: ██░░░░░░░░ 1.86 GiB / 15.48 GiB (12%)`. Filled cells are `ceil(pct / 10)`. Empty cells use the theme's `muted` color. Each battery gets its own bar.
 - Bar color uses these thresholds:
 
   | Level | Usage | Battery charge |
@@ -168,7 +168,7 @@ Measured on the dev machine:
   | warn | 60–85% | 15–40% |
   | crit | > 85% | < 15% |
 
-  The colors are ANSI green, yellow and red (SGR 32/33/31), so they follow the user's terminal theme.
+  The filled cells use ANSI green, yellow and red (SGR 32/33/31), so they follow the user's terminal theme.
 - In no-color mode the bar is drawn in ASCII: `[##--------]`.
 - Toggle with `--no-bars` or config `bars = false`.
 
@@ -178,24 +178,26 @@ Measured on the dev machine:
 |----|-------|--------|------|---------|
 | `load` | Load | `/proc/loadavg`, shown with the thread count: `0.14, 0.15, 0.08 (16 threads)` | fast | on |
 | `temp` | CPU Temp | `/sys/class/hwmon/*` where the name is `coretemp`, `k10temp` or `zenpower`; otherwise `/sys/class/thermal/thermal_zone*` with type `x86_pkg_temp`. Hidden on WSL, which exposes neither. | fast | on |
-| `git` | Git | `git status --porcelain=v2 --branch` in the current directory: `main ↑1 ↓0, 3 changed`. Only shown inside a repo. 50 ms timeout, then hidden. | spawn | on |
+| `git` | Git | `git --no-optional-locks status --porcelain=v2 --branch` in the current directory: `main ↑1 ↓0, 3 changed` or `main, clean`. Arrows appear only when ahead/behind isn't 0:0. A detached HEAD shows the short oid. Only shown inside a repo. 50 ms timeout, then hidden. `--no-optional-locks` matters: a timed-out run must not leave an `index.lock` behind. | spawn | on |
 | `toolchains` | Toolchains | `rustc --version`, `node --version`, `python3 --version`, all in parallel: `rust 1.98.1 · node 22.x · python 3.12`. Shows only the ones installed. | spawn (20–30 ms each, through rustup proxies) | off |
-| `docker` | Containers | `GET /containers/json` over `/var/run/docker.sock` using a std `UnixStream` (no `docker` process): `3 running`. Hidden if the socket is missing or not accessible. | fast | off |
+| `docker` | Containers | `GET /containers/json` (HTTP/1.0) over `/var/run/docker.sock` using a std `UnixStream` (no `docker` process): `3 running`. 100 ms timeout. Hidden if the socket is missing or not accessible, or the reply isn't a complete 200. | fast | off |
 | `ip` | Local IP | `getifaddrs`, first IPv4 address that isn't loopback: `192.168.1.20 (eth0)` | fast | off (people post screenshots) |
 | `updates` | Updates | Ubuntu: parse `/var/lib/update-notifier/updates-available`. Never run a package-manager query. | fast | off |
 
-Default order for the info column: OS, Host, Windows, Kernel, Uptime, Packages, Shell, Resolution, DE, WM, Terminal, CPU, CPU Temp, Load, GPU, Memory, Disk, Battery, Git, Locale. Opt-in modules are appended in the order they are enabled.
+Default order for the info column: OS, Host, Windows, Kernel, Uptime, Packages, Shell, Resolution, DE, WM, Terminal, CPU, CPU Temp, Load, GPU, Memory, Disk, Battery, Git, Locale.
+
+`--modules id,id,...` replaces the module list, in the given order; it's how opt-in modules are enabled from the command line, and it overrides the config file's `modules` (R6). Each unknown id produces one warning and is skipped.
 
 #### F3.3 Responsive layout
 
 - `--layout auto|side|stacked` (config `layout`), default `auto`.
 - `auto`:
   1. **Side by side** if the logo can be at least 16 columns wide with the info column at least 32 (this is today's logic).
-  2. Otherwise **stacked**: the logo goes above the info, at width `min(48, terminal width)`, if the logo rows plus the info rows plus 2 fit in the terminal height.
+  2. Otherwise **stacked**: the logo goes above the info, left-aligned, with a blank row between them. Its width is `min(48, terminal width, the widest whose rows fit in terminal height − info rows − 3)`, and it must be at least 16 columns.
   3. Otherwise no logo (this is today's fallback).
-- Today, terminals narrower than about 51 columns lose the logo completely.
+- `side` and `stacked` force that arrangement, with no logo if it doesn't fit. An explicit `--size` skips the height-based shrinking.
 
-**Acceptance:** table-driven tests for terminal sizes 200×50, 120×30, 80×24, 50×40, 40×20 and 30×10 that check the chosen layout and logo width.
+**Acceptance:** table-driven tests for terminal sizes 200×50, 120×30, 80×24, 50×40, 40×20 and 30×10 (and the boundaries around them) that check the chosen layout and logo width.
 
 ### F4 — Personality: quips
 

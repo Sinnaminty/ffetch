@@ -1,0 +1,4 @@
+program: rustc
+arg: --version
+---
+rustc 1.98.1 (48a229cea 2026-09-01)
