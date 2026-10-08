@@ -1,6 +1,8 @@
 # ffetch — Differentiation Spec
 
-Status: Draft · 2026-10-08 · Takes ffetch from 0.1.0 to 0.2.0
+Status: Implemented (M1–M6) on branch `spec-v0.2` · 2026-10-08 · Takes ffetch from 0.1.0 to 0.2.0
+
+Decisions made during implementation are folded into the sections below; §8 notes the current behavior for each open question.
 
 ## 1. Context
 
@@ -366,10 +368,12 @@ M1 and M2 are the most distinctive and the most visible, so they come first. The
 
 ## 8. Open questions
 
-1. **Quips on by default?** The spec says yes because it's the most memorable feature. It could be off by default for a quieter tool.
-2. **Light terminals:** auto-detect the background with an OSC 11 query (adds a terminal round trip and is complicated when output isn't a TTY), or rely on `theme.background` only?
-3. **Value color:** values currently stay the terminal's default color. Should they be themed too?
-4. **Non-NVIDIA GPUs on WSL:** is a `powershell.exe` call (hundreds of ms, once per boot) acceptable, or should they stay as "Basic Render Driver"?
-5. **Image formats:** add JPEG/WebP (the `image` crate adds compile time; `zune-jpeg` is lighter) or keep PNG only?
-6. **JSON stability:** commit to `schema: 1` as public at 0.2.0, or keep it experimental until 1.0?
-7. **Windows Terminal profile name (F2.4 stretch):** worth the complexity?
+1. **Quips on by default?** The spec says yes because it's the most memorable feature. It could be off by default for a quieter tool. *Currently: on; `--no-quip` or `quip = false`.*
+2. **Light terminals:** auto-detect the background with an OSC 11 query (adds a terminal round trip and is complicated when output isn't a TTY), or rely on `theme.background` only? *Currently: config only. The light theme adjusts the title, labels and borders, but the ASCII logo is still tuned for dark backgrounds, so its cream areas look pale on white.*
+3. **Value color:** values currently stay the terminal's default color. Should they be themed too? *Currently: default color.*
+4. **Non-NVIDIA GPUs on WSL:** is a `powershell.exe` call (hundreds of ms, once per boot) acceptable, or should they stay as "Basic Render Driver"? *Currently: PowerShell fallback, measured at 0.6–0.75 s on the first run after a boot.*
+5. **Image formats:** add JPEG/WebP (the `image` crate adds compile time; `zune-jpeg` is lighter) or keep PNG only? *Currently: PNG only.*
+6. **JSON stability:** commit to `schema: 1` as public at 0.2.0, or keep it experimental until 1.0? *Currently: `schema: 1`, no stability promise written down.*
+7. **Windows Terminal profile name (F2.4 stretch):** worth the complexity? *Currently: not implemented.*
+8. **Interop without `appendWindowsPath`:** `cmd.exe` and `powershell.exe` are found through `PATH`, so they're missing when WSL's `appendWindowsPath=false`. Fall back to `/mnt/c/Windows/System32/...`? *Currently: no fallback; the Windows line is hidden and the GPU falls back to the PCI name.*
+9. **`--format` extras:** `{user}` and `{hostname}` placeholders for prompts? *Currently: module placeholders only.*
