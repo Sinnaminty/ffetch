@@ -188,7 +188,60 @@ fn bad_arguments_exit_2() {
 fn help_lists_the_new_options() {
     let cache = temp_dir("help");
     let help = stdout(&ffetch(&cache, &["--help"]));
-    for option in ["--image", "--keep-background", "--swatches"] {
+    for option in ["--image", "--keep-background", "--swatches", "--refresh"] {
         assert!(help.contains(option), "{option} missing from --help");
     }
+}
+
+/// Whether this is WSL, by the same rule ffetch uses.
+fn on_wsl() -> bool {
+    let release = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    release.to_lowercase().contains("microsoft")
+        || std::env::var("WSL_DISTRO_NAME").is_ok_and(|d| !d.is_empty())
+}
+
+#[test]
+fn facts_are_cached_per_boot_until_refreshed() {
+    let cache = temp_dir("facts");
+    let facts = cache.join("ffetch/facts.json");
+    let plain = ["--no-color", "--logo", "none"];
+    let first = ffetch(&cache, &plain);
+    assert!(first.status.success());
+    assert!(first.stderr.is_empty(), "{:?}", stderr_lines(&first));
+
+    if !on_wsl() {
+        // Off WSL nothing is cached and the output has no WSL lines.
+        assert!(!stdout(&first).contains("Windows:"));
+        let refreshed = ffetch(&cache, &["--refresh"]);
+        assert!(refreshed.status.success());
+        assert!(!facts.exists(), "no facts file off WSL");
+        return;
+    }
+
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    let boot_id = boot_id.trim();
+    let text = fs::read_to_string(&facts).expect("the first run on WSL writes the facts");
+    assert!(
+        text.contains(&format!("\"boot_id\": \"{boot_id}\"")),
+        "{text}"
+    );
+
+    // Later runs use the cached facts instead of looking them up again...
+    let doctored = format!(
+        r#"{{"boot_id": "{boot_id}", "facts": {{"windows": "Windows 99 (build 1)", "gpu": null}}}}"#
+    );
+    fs::write(&facts, &doctored).unwrap();
+    let cached = stdout(&ffetch(&cache, &plain));
+    assert!(cached.contains("Windows: Windows 99 (build 1)"), "{cached}");
+
+    // ...until --refresh looks them up again...
+    let refreshed = ffetch(&cache, &["--no-color", "--logo", "none", "--refresh"]);
+    assert!(refreshed.status.success());
+    assert!(!stdout(&refreshed).contains("Windows 99"));
+    assert!(!fs::read_to_string(&facts).unwrap().contains("Windows 99"));
+
+    // ...or the machine reboots.
+    fs::write(&facts, doctored.replace(boot_id, "another-boot")).unwrap();
+    assert!(!stdout(&ffetch(&cache, &plain)).contains("Windows 99"));
+    assert!(fs::read_to_string(&facts).unwrap().contains(boot_id));
 }

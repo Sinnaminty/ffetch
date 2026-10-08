@@ -5,9 +5,12 @@ use std::{
     ffi::CStr,
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
+    sync::OnceLock,
     thread,
 };
+
+use crate::{cache::Facts, command, wsl};
 
 pub struct System {
     pub user: String,
@@ -23,6 +26,7 @@ type Module = fn() -> Option<String>;
 const MODULES: &[(&str, Module)] = &[
     ("OS", os),
     ("Host", host),
+    ("Windows", windows),
     ("Kernel", kernel),
     ("Uptime", uptime),
     ("Packages", packages),
@@ -39,8 +43,23 @@ const MODULES: &[(&str, Module)] = &[
     ("Locale", locale),
 ];
 
-/// Runs every module concurrently; a few of them spawn processes or scan big files.
-pub fn collect() -> System {
+/// Facts cached until the next boot. `collect` loads them before the module
+/// threads start and saves them after. (A global only until modules get a
+/// context to carry it, see SPEC §5.1.)
+static FACTS: OnceLock<Facts> = OnceLock::new();
+
+/// The per-boot fact `key`, computed by `compute` when it isn't cached.
+fn cached(key: &str, compute: impl FnOnce() -> Option<String>) -> Option<String> {
+    match FACTS.get() {
+        Some(facts) => facts.get(key, compute),
+        None => compute(),
+    }
+}
+
+/// Runs every module concurrently; a few of them spawn processes or scan big
+/// files. With `refresh`, cached facts are looked up again.
+pub fn collect(refresh: bool) -> System {
+    let facts = FACTS.get_or_init(|| Facts::load(refresh));
     let fields = thread::scope(|s| {
         let handles: Vec<_> = MODULES
             .iter()
@@ -57,6 +76,8 @@ pub fn collect() -> System {
             })
             .collect()
     });
+    // Failing to cache only costs the slow lookups again next run.
+    let _ = facts.save();
     System {
         user: user(),
         host: uname().nodename,
@@ -151,6 +172,11 @@ const DMI_PLACEHOLDERS: &[&str] = &[
 ];
 
 fn host() -> Option<String> {
+    if wsl::current().is_some()
+        && let Some(host) = wsl::host()
+    {
+        return Some(host);
+    }
     let dmi = |f: &str| {
         read(format!("/sys/devices/virtual/dmi/id/{f}"))
             .filter(|v| !DMI_PLACEHOLDERS.iter().any(|p| v.eq_ignore_ascii_case(p)))
@@ -164,15 +190,17 @@ fn host() -> Option<String> {
     if let Some(model) = read("/sys/firmware/devicetree/base/model") {
         return Some(model.trim_end_matches('\0').to_string());
     }
-    let release = uname().release.to_lowercase();
-    release.contains("microsoft").then(|| {
-        let wsl = if release.contains("wsl2") {
-            " (WSL2)"
-        } else {
-            ""
-        };
-        format!("Windows Subsystem for Linux{wsl}")
+    // WSL without a working `wslinfo`.
+    wsl::current().map(|version| match version {
+        wsl::Wsl::V2 => "Windows Subsystem for Linux (WSL2)".into(),
+        wsl::Wsl::V1 => "Windows Subsystem for Linux".into(),
     })
+}
+
+/// The Windows version under WSL. `cmd.exe` is slow, so it's cached per boot.
+fn windows() -> Option<String> {
+    wsl::current()?;
+    cached("windows", wsl::windows)
 }
 
 fn kernel() -> Option<String> {
@@ -261,11 +289,9 @@ fn rpm_count() -> Option<usize> {
     if !Path::new("/var/lib/rpm").exists() && !Path::new("/usr/lib/sysimage/rpm").exists() {
         return None;
     }
-    let out = Command::new("rpm")
-        .args(["-qa", "--qf", ".\n"])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let mut rpm = Command::new("rpm");
+    rpm.args(["-qa", "--qf", ".\n"]);
+    let out = command::run(rpm)?;
     Some(out.stdout.iter().filter(|&&b| b == b'\n').count())
 }
 
@@ -276,25 +302,21 @@ fn shell() -> Option<String> {
     if !matches!(name.as_str(), "bash" | "zsh" | "fish" | "nu" | "tcsh") {
         return Some(name);
     }
-    let version = Command::new(&path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .and_then(|o| {
-            let out = String::from_utf8_lossy(&o.stdout).into_owned();
-            let word = out
-                .lines()
-                .next()?
-                .split_whitespace()
-                .find(|w| w.starts_with(|c: char| c.is_ascii_digit()))?;
-            Some(
-                word.chars()
-                    .take_while(|c| c.is_ascii_digit() || *c == '.')
-                    .collect::<String>(),
-            )
-        });
+    let mut cmd = Command::new(&path);
+    cmd.arg("--version");
+    let version = command::run(cmd).and_then(|o| {
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        let word = out
+            .lines()
+            .next()?
+            .split_whitespace()
+            .find(|w| w.starts_with(|c: char| c.is_ascii_digit()))?;
+        Some(
+            word.chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect::<String>(),
+        )
+    });
     Some(match version {
         Some(v) => format!("{name} {v}"),
         None => name,
@@ -400,11 +422,8 @@ const NOT_TERMINALS: &[&str] = &[
 ];
 
 fn terminal() -> Option<String> {
-    if let Some(program) = env_nonempty("TERM_PROGRAM") {
-        return Some(pretty_terminal(&program));
-    }
-    if env::var_os("WT_SESSION").is_some() {
-        return Some("Windows Terminal".into());
+    if let Some(name) = env_terminal(|key| env::var(key).ok()) {
+        return Some(name);
     }
     let mut pid = unsafe { libc::getppid() } as u32;
     while pid > 1 {
@@ -426,6 +445,31 @@ fn terminal() -> Option<String> {
         pid = ppid;
     }
     env_nonempty("TERM")
+}
+
+/// The terminal as named by the environment (`var` looks up a variable), if it is.
+fn env_terminal(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let windows_terminal = var("WT_SESSION").is_some();
+    // Windows Terminal's variable reaches a multiplexer started from it.
+    if windows_terminal && let Some(mux) = multiplexer(&var) {
+        return Some(format!("{mux} (Windows Terminal)"));
+    }
+    if let Some(program) = var("TERM_PROGRAM").filter(|p| !p.is_empty()) {
+        return Some(pretty_terminal(&program));
+    }
+    windows_terminal.then(|| "Windows Terminal".into())
+}
+
+fn multiplexer(var: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+    if var("TMUX").is_some() || var("TERM_PROGRAM").as_deref() == Some("tmux") {
+        Some("tmux")
+    } else if var("ZELLIJ").is_some() {
+        Some("zellij")
+    } else if var("STY").is_some() {
+        Some("screen")
+    } else {
+        None
+    }
 }
 
 fn pretty_terminal(name: &str) -> String {
@@ -502,6 +546,12 @@ fn cpu() -> Option<String> {
 }
 
 fn gpu() -> Option<String> {
+    // On WSL the PCI scan only finds the virtual "Microsoft Basic Render Driver".
+    if wsl::current().is_some()
+        && let Some(gpus) = cached("gpu", wsl::gpus)
+    {
+        return Some(gpus);
+    }
     let mut pci_ids: Option<Option<String>> = None;
     let mut gpus: Vec<String> = Vec::new();
     for dev in sorted_dir("/sys/bus/pci/devices") {
@@ -651,4 +701,61 @@ fn battery() -> Option<String> {
 
 fn locale() -> Option<String> {
     env_nonempty("LC_ALL").or_else(|| env_nonempty("LANG"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `env_terminal` with only the variables in `vars` set.
+    fn terminal_with(vars: &[(&str, &str)]) -> Option<String> {
+        env_terminal(|key| {
+            vars.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        })
+    }
+
+    #[test]
+    fn windows_terminal_around_a_multiplexer() {
+        let wt = ("WT_SESSION", "0a6f0c4e-1c7e-4d1a-9a8e-2f6f0c4e1c7e");
+        let tmux = ("TMUX", "/tmp/tmux-1000/default,1266,0");
+        let both = Some("tmux (Windows Terminal)");
+        assert_eq!(
+            terminal_with(&[wt, tmux, ("TERM_PROGRAM", "tmux")]).as_deref(),
+            both
+        );
+        assert_eq!(terminal_with(&[wt, tmux]).as_deref(), both);
+        assert_eq!(
+            terminal_with(&[wt, ("TERM_PROGRAM", "tmux")]).as_deref(),
+            both
+        );
+        assert_eq!(
+            terminal_with(&[wt, ("STY", "1234.pts-0.host")]).as_deref(),
+            Some("screen (Windows Terminal)")
+        );
+        assert_eq!(
+            terminal_with(&[wt, ("ZELLIJ", "0")]).as_deref(),
+            Some("zellij (Windows Terminal)")
+        );
+    }
+
+    #[test]
+    fn terminal_from_the_environment_is_otherwise_unchanged() {
+        let wt = ("WT_SESSION", "0a6f0c4e-1c7e-4d1a-9a8e-2f6f0c4e1c7e");
+        let tmux = ("TMUX", "/tmp/tmux-1000/default,1266,0");
+        assert_eq!(terminal_with(&[wt]).as_deref(), Some("Windows Terminal"));
+        assert_eq!(
+            terminal_with(&[wt, ("TERM_PROGRAM", "vscode")]).as_deref(),
+            Some("VS Code")
+        );
+        assert_eq!(
+            terminal_with(&[tmux, ("TERM_PROGRAM", "tmux")]).as_deref(),
+            Some("tmux")
+        );
+        // Left to the process tree walk.
+        assert_eq!(terminal_with(&[tmux]), None);
+        assert_eq!(terminal_with(&[("TERM_PROGRAM", "")]), None);
+        assert_eq!(terminal_with(&[]), None);
+    }
 }

@@ -1,9 +1,11 @@
 mod cache;
+mod command;
 mod image;
 mod info;
 mod logo;
 mod palette;
 mod term;
+mod wsl;
 
 use std::{
     io::{self, Write},
@@ -36,6 +38,7 @@ Options:
       --keep-background  With --image, keep the image's background instead of removing it
       --swatches <kind>  Color swatches: palette (default), ansi, none
       --no-color         Disable colors (NO_COLOR is honored too)
+      --refresh          Recompute the facts cached until the next boot
   -h, --help             Show this help
   -V, --version          Show the version
 ";
@@ -57,6 +60,8 @@ struct Args {
     image: Option<PathBuf>,
     keep_background: bool,
     swatches: Swatches,
+    /// Recompute the facts cached per boot.
+    refresh: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -67,6 +72,7 @@ fn parse_args() -> Result<Args, String> {
         image: None,
         keep_background: false,
         swatches: Swatches::Palette,
+        refresh: false,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -96,6 +102,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--image" => args.image = Some(value().ok_or("--image expects a path")?.into()),
             "--keep-background" => args.keep_background = true,
+            "--refresh" => args.refresh = true,
             "--swatches" => {
                 args.swatches = match value().as_deref() {
                     Some("palette") => Swatches::Palette,
@@ -133,7 +140,7 @@ fn main() {
     let palette = palette::extract(&image.pixels, image.background);
     let roles = Theme::default().roles(&palette);
     let swatches = swatch_rows(args.swatches, &palette, mode);
-    let sys = info::collect();
+    let sys = info::collect(args.refresh);
     let term = term::size();
 
     let info_cols = natural_info_width(&sys, &swatches);

@@ -2,14 +2,17 @@
 //!
 //! Processed `--image` logos are stored as `images/<key>.rgba`. The key hashes
 //! the image's canonical path, size and mtime, so editing or replacing the file
-//! gives it a new entry. The cache is never essential: a missing or malformed
-//! entry is recomputed, and a failed write is ignored.
+//! gives it a new entry. Slow facts that only change across reboots are kept in
+//! `facts.json` (see `Facts`). The cache is never essential: a missing or
+//! malformed entry is recomputed, and a failed write is ignored.
 
 use std::{
+    collections::BTreeMap,
     env, fs, io,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
     process,
+    sync::{Mutex, PoisonError},
 };
 
 use crate::image::{self, Image};
@@ -117,13 +120,235 @@ fn write_image(entry: &Path, img: &Image) -> io::Result<()> {
     data.push(img.background.is_some() as u8);
     data.extend_from_slice(&img.background.unwrap_or_default());
     data.extend_from_slice(&img.pixels);
+    write_atomic(entry, &data)
+}
 
-    let tmp = entry.with_extension(format!("tmp{}", process::id()));
-    let result = fs::write(&tmp, &data).and_then(|()| fs::rename(&tmp, entry));
+/// Writes `path` atomically: to a temporary file, then renamed into place, so
+/// readers never see a half-written file.
+fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+    fs::create_dir_all(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+    let tmp = path.with_extension(format!("tmp{}", process::id()));
+    let result = fs::write(&tmp, data).and_then(|()| fs::rename(&tmp, path));
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// Changes on every boot, including a `wsl --shutdown` or a Windows reboot.
+const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
+
+/// Fact name -> value; `None` records a lookup that found nothing.
+type FactMap = BTreeMap<String, Option<String>>;
+
+/// Facts that hold until the next boot, such as the Windows version on WSL,
+/// kept in `facts.json` as `{ "boot_id": "…", "facts": { "<key>": "<value>" } }`.
+/// A lookup that found nothing is stored as `null`, so machines without the
+/// tools don't retry it on every run.
+///
+/// The file is read once before the modules run and written once after they
+/// finish, so the module threads only share this struct, never the file.
+pub struct Facts {
+    file: Option<PathBuf>,
+    boot_id: Option<String>,
+    /// Facts from the file, when it is for this boot and not being refreshed.
+    known: FactMap,
+    /// Facts computed during this run.
+    fresh: Mutex<FactMap>,
+}
+
+impl Facts {
+    /// The facts cached for the current boot. With `refresh`, each fact is
+    /// computed again (and the result saved).
+    pub fn load(refresh: bool) -> Facts {
+        let boot_id = fs::read_to_string(BOOT_ID).ok();
+        Facts::open(dir().map(|d| d.join("facts.json")), boot_id, refresh)
+    }
+
+    fn open(file: Option<PathBuf>, boot_id: Option<String>, refresh: bool) -> Facts {
+        // Without a boot ID there's no telling when a fact goes stale, so
+        // nothing is cached.
+        let boot_id = boot_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+        let known = match (&file, &boot_id) {
+            (Some(file), Some(boot_id)) if !refresh => fs::read_to_string(file)
+                .ok()
+                .and_then(|text| parse_facts(&text))
+                .filter(|(id, _)| id == boot_id)
+                .map(|(_, facts)| facts)
+                .unwrap_or_default(),
+            _ => FactMap::new(),
+        };
+        Facts {
+            file,
+            boot_id,
+            known,
+            fresh: Mutex::default(),
+        }
+    }
+
+    /// The fact `key`: the cached value (which may be a cached `None`), or else
+    /// `compute()`, which is remembered for `save`.
+    pub fn get(&self, key: &str, compute: impl FnOnce() -> Option<String>) -> Option<String> {
+        if let Some(value) = self.known.get(key) {
+            return value.clone();
+        }
+        let value = compute();
+        self.fresh
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key.to_string(), value.clone());
+        value
+    }
+
+    /// Writes the cached facts plus the ones computed this run, if there are any.
+    pub fn save(&self) -> io::Result<()> {
+        let fresh = self.fresh.lock().unwrap_or_else(PoisonError::into_inner);
+        let (Some(file), Some(boot_id)) = (&self.file, &self.boot_id) else {
+            return Ok(());
+        };
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        let mut facts = self.known.clone();
+        facts.extend(fresh.iter().map(|(k, v)| (k.clone(), v.clone())));
+        write_atomic(file, facts_json(boot_id, &facts).as_bytes())
+    }
+}
+
+/// The facts file. Keys are sorted, so the same facts give the same file.
+fn facts_json(boot_id: &str, facts: &FactMap) -> String {
+    let entries: Vec<String> = facts
+        .iter()
+        .map(|(key, value)| {
+            let value = value.as_deref().map_or("null".into(), json_string);
+            format!("    {}: {value}", json_string(key))
+        })
+        .collect();
+    let facts = match entries.is_empty() {
+        true => "{}".to_string(),
+        false => format!("{{\n{}\n  }}", entries.join(",\n")),
+    };
+    format!(
+        "{{\n  \"boot_id\": {},\n  \"facts\": {facts}\n}}\n",
+        json_string(boot_id)
+    )
+}
+
+/// `s` as a JSON string literal.
+fn json_string(s: &str) -> String {
+    let mut out = String::from('"');
+    for c in s.chars() {
+        match c {
+            '"' => out += "\\\"",
+            '\\' => out += "\\\\",
+            '\n' => out += "\\n",
+            '\r' => out += "\\r",
+            '\t' => out += "\\t",
+            c if c < ' ' => out += &format!("\\u{:04x}", c as u32),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The boot ID and facts from a facts file; `None` unless it has the shape
+/// `facts_json` writes (in any key order or spacing).
+fn parse_facts(text: &str) -> Option<(String, FactMap)> {
+    let mut json = Json(text);
+    let (mut boot_id, mut facts) = (None, FactMap::new());
+    json.object(|json, key| match key.as_str() {
+        "boot_id" => {
+            boot_id = Some(json.string()?);
+            Some(())
+        }
+        "facts" => json.object(|json, key| {
+            let value = if json.eat("null") {
+                None
+            } else {
+                Some(json.string()?)
+            };
+            facts.insert(key, value);
+            Some(())
+        }),
+        _ => None,
+    })?;
+    json.0.trim().is_empty().then_some((boot_id?, facts))
+}
+
+/// A cursor over the little JSON the facts file uses: objects, strings and `null`.
+struct Json<'a>(&'a str);
+
+impl Json<'_> {
+    /// Skips whitespace, then consumes `token` if it is next.
+    fn eat(&mut self, token: &str) -> bool {
+        let rest = self.0.trim_start().strip_prefix(token);
+        if let Some(rest) = rest {
+            self.0 = rest;
+        }
+        rest.is_some()
+    }
+
+    /// An object, calling `field` with each key to parse the value after it.
+    fn object(&mut self, mut field: impl FnMut(&mut Self, String) -> Option<()>) -> Option<()> {
+        if !self.eat("{") {
+            return None;
+        }
+        if self.eat("}") {
+            return Some(());
+        }
+        loop {
+            let key = self.string()?;
+            if !self.eat(":") {
+                return None;
+            }
+            field(self, key)?;
+            if self.eat("}") {
+                return Some(());
+            }
+            if !self.eat(",") {
+                return None;
+            }
+        }
+    }
+
+    /// A string, unescaped. `\u` escapes of UTF-16 surrogates are not supported;
+    /// the writer never produces them.
+    fn string(&mut self) -> Option<String> {
+        if !self.eat("\"") {
+            return None;
+        }
+        let text = self.0;
+        let mut chars = text.char_indices();
+        let mut out = String::new();
+        loop {
+            let (i, c) = chars.next()?;
+            out.push(match c {
+                '"' => {
+                    self.0 = &text[i + 1..];
+                    return Some(out);
+                }
+                '\\' => match chars.next()?.1 {
+                    c @ ('"' | '\\' | '/') => c,
+                    'b' => '\u{8}',
+                    'f' => '\u{c}',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    'u' => {
+                        let code = (0..4)
+                            .try_fold(0, |n, _| Some(n * 16 + chars.next()?.1.to_digit(16)?))?;
+                        char::from_u32(code)?
+                    }
+                    _ => return None,
+                },
+                c if c < ' ' => return None,
+                c => c,
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +476,203 @@ mod tests {
         // Without a cache directory it still works.
         assert_eq!(image(&file, false, None).unwrap(), first);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Facts in `dir`, with a fake boot ID.
+    fn facts(dir: &Path, boot_id: &str, refresh: bool) -> Facts {
+        Facts::open(
+            Some(dir.join("facts.json")),
+            Some(format!("{boot_id}\n")),
+            refresh,
+        )
+    }
+
+    fn uncached() -> Option<String> {
+        panic!("the fact should have come from the cache")
+    }
+
+    #[test]
+    fn facts_round_trip_including_negative_results() {
+        let dir = temp_dir("facts-round-trip");
+        let first = facts(&dir, "boot-a", false);
+        assert_eq!(
+            first.get("windows", || Some("Windows 11".into())),
+            Some("Windows 11".into())
+        );
+        assert_eq!(first.get("gpu", || None), None);
+        first.save().unwrap();
+        let text = fs::read_to_string(dir.join("facts.json")).unwrap();
+        assert!(text.contains("\"gpu\": null"), "{text}");
+
+        let second = facts(&dir, "boot-a", false);
+        assert_eq!(second.get("windows", uncached), Some("Windows 11".into()));
+        assert_eq!(
+            second.get("gpu", uncached),
+            None,
+            "negative results are cached"
+        );
+        // A new fact is merged in; the old ones are kept.
+        assert_eq!(second.get("other", || Some("x".into())), Some("x".into()));
+        second.save().unwrap();
+        let third = facts(&dir, "boot-a", false);
+        assert_eq!(third.get("windows", uncached), Some("Windows 11".into()));
+        assert_eq!(third.get("other", uncached), Some("x".into()));
+        // Only the file is left behind, no temporary files.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn facts_from_another_boot_are_stale() {
+        let dir = temp_dir("facts-boot");
+        let old = facts(&dir, "boot-a", false);
+        old.get("windows", || Some("Windows 10".into()));
+        old.get("gpu", || Some("GPU".into()));
+        old.save().unwrap();
+
+        let new = facts(&dir, "boot-b", false);
+        assert_eq!(
+            new.get("windows", || Some("Windows 11".into())),
+            Some("Windows 11".into())
+        );
+        new.save().unwrap();
+        let text = fs::read_to_string(dir.join("facts.json")).unwrap();
+        assert!(
+            text.contains("boot-b") && !text.contains("boot-a"),
+            "{text}"
+        );
+        assert!(!text.contains("GPU"), "stale facts are dropped: {text}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refresh_recomputes_cached_facts() {
+        let dir = temp_dir("facts-refresh");
+        let old = facts(&dir, "boot-a", false);
+        old.get("windows", || None);
+        old.save().unwrap();
+
+        let refreshed = facts(&dir, "boot-a", true);
+        assert_eq!(
+            refreshed.get("windows", || Some("Windows 11".into())),
+            Some("Windows 11".into())
+        );
+        refreshed.save().unwrap();
+        assert_eq!(
+            facts(&dir, "boot-a", false).get("windows", uncached),
+            Some("Windows 11".into())
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn facts_file_is_only_written_when_something_was_computed() {
+        let dir = temp_dir("facts-no-write");
+        facts(&dir, "boot-a", false).save().unwrap();
+        assert!(!dir.join("facts.json").exists());
+
+        let first = facts(&dir, "boot-a", false);
+        first.get("windows", || Some("Windows 11".into()));
+        first.save().unwrap();
+        let before = fs::metadata(dir.join("facts.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let cached = facts(&dir, "boot-a", false);
+        cached.get("windows", uncached);
+        cached.save().unwrap();
+        let after = fs::metadata(dir.join("facts.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after);
+
+        // Without a boot ID or a cache directory nothing is cached or written.
+        for unusable in [
+            Facts::open(Some(dir.join("other.json")), None, false),
+            Facts::open(Some(dir.join("other.json")), Some(" \n".into()), false),
+            Facts::open(None, Some("boot-a".into()), false),
+        ] {
+            assert_eq!(
+                unusable.get("windows", || Some("x".into())),
+                Some("x".into())
+            );
+            unusable.save().unwrap();
+        }
+        assert!(!dir.join("other.json").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_facts_files_are_treated_as_empty() {
+        let dir = temp_dir("facts-corrupt");
+        let file = dir.join("facts.json");
+        let good = r#"{"boot_id": "boot-a", "facts": {"windows": "Windows 11"}}"#;
+        assert!(parse_facts(good).is_some());
+        for bad in [
+            "",
+            "not json",
+            &good[..good.len() - 1],
+            r#"{"boot_id": "boot-a", "facts": {"windows": 11}}"#,
+            r#"{"boot_id": "boot-a", "facts": {"windows": "Windows 11",}}"#,
+            r#"{"boot_id": "boot-a", "facts": {"windows": "Windows 11"}} trailing"#,
+            r#"{"boot_id": "boot-a", "facts": {"windows": "bad \q escape"}}"#,
+            "{\"boot_id\": \"boot-a\", \"facts\": {\"windows\": \"raw\ncontrol\"}}",
+            r#"{"boot_id": "boot-a", "facts": {"windows": "\ud800"}}"#,
+            r#"{"boot_id": "boot-a", "extra": "x", "facts": {}}"#,
+            r#"{"facts": {"windows": "Windows 11"}}"#,
+        ] {
+            assert_eq!(parse_facts(bad), None, "{bad:?}");
+            fs::write(&file, bad).unwrap();
+            let corrupt = facts(&dir, "boot-a", false);
+            assert_eq!(
+                corrupt.get("windows", || Some("fresh".into())),
+                Some("fresh".into())
+            );
+            corrupt.save().unwrap();
+            assert_eq!(
+                facts(&dir, "boot-a", false).get("windows", uncached),
+                Some("fresh".into())
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn facts_json_escapes_and_unescapes() {
+        assert_eq!(json_string("plain"), r#""plain""#);
+        assert_eq!(
+            json_string("a\"b\\c\nd\te\u{1}f\u{1f}"),
+            r#""a\"b\\c\nd\te\u0001f\u001f""#
+        );
+        assert_eq!(json_string("Grafik ™ 日本"), "\"Grafik ™ 日本\"");
+
+        let tricky = [
+            "quote \" backslash \\ slash /",
+            "lines\r\nand\ttabs",
+            "\u{0}\u{8}\u{c}\u{7f}",
+            "Intel(R) UHD Graphics\nNVIDIA T1200 Laptop GPU",
+            "ünïcödé ™ 日本 😀",
+            "",
+        ];
+        let facts: FactMap = tricky
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (format!("key \"{i}\"\\"), Some(v.to_string())))
+            .chain([("absent".to_string(), None)])
+            .collect();
+        let text = facts_json("boot \"id\"", &facts);
+        assert_eq!(parse_facts(&text), Some(("boot \"id\"".to_string(), facts)));
+
+        // Escapes the writer never produces are still understood.
+        let text = r#" { "facts" : { "k" : "\/\b\féé" } , "boot_id" : "b" } "#;
+        let (boot_id, facts) = parse_facts(text).unwrap();
+        assert_eq!(boot_id, "b");
+        assert_eq!(facts["k"].as_deref(), Some("/\u{8}\u{c}éé"));
+        assert_eq!(
+            parse_facts(r#"{"boot_id": "b", "facts": {}}"#),
+            Some(("b".into(), FactMap::new()))
+        );
     }
 
     #[test]
