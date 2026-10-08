@@ -180,7 +180,6 @@ impl Info {
     }
 
     /// The value of the module `id`, if it ran and had one.
-    #[cfg_attr(not(test), expect(dead_code, reason = "for quips (M5) and M6"))]
     pub fn get(&self, id: &str) -> Option<&Value> {
         self.modules
             .iter()

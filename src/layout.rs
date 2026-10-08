@@ -5,6 +5,7 @@ use crate::{
     info::{Info, Level, Meter, Row},
     logo::{LogoImage, Style},
     palette::{Palette, Roles},
+    quip,
     term::{ColorMode, RESET, Rgb},
 };
 
@@ -61,6 +62,8 @@ pub struct Options {
     pub roles: Roles,
     /// Background colour codes for each swatch row, from `swatch_rows`.
     pub swatches: Vec<Vec<String>>,
+    /// The remark in the speech bubble under the info column, if any.
+    pub quip: Option<String>,
 }
 
 /// The whole output for a terminal `term` (columns, rows) wide and high, or
@@ -73,7 +76,7 @@ pub fn render(
 ) -> String {
     let rows = info.rows();
     let natural = natural_width(info, &rows, opts);
-    let height = info_lines(info, &rows, opts, None).len();
+    let height = info_lines(info, &rows, opts, None, false).len();
     let placement = match opts.logo {
         Some(_) => place(opts.layout, image, opts.size, (natural, height), term),
         None => Placement::NoLogo,
@@ -82,7 +85,9 @@ pub fn render(
         Placement::Side(cols) => width.saturating_sub(cols + GAP),
         _ => width,
     });
-    let column = info_lines(info, &rows, opts, max_info_cols);
+    // The bubble's tail points at a logo beside it.
+    let tail = matches!(placement, Placement::Side(_));
+    let column = info_lines(info, &rows, opts, max_info_cols, tail);
     let logo = match (opts.logo, placement) {
         (Some(style), Placement::Side(cols) | Placement::Stacked(cols)) => {
             image.render(style, cols, opts.mode)
@@ -191,14 +196,19 @@ fn compose(placement: Placement, logo: &[String], column: &[String]) -> String {
     out
 }
 
-/// How wide the info column is without truncation.
+/// How wide the info column is without truncation, beside a logo.
 fn natural_width(info: &Info, rows: &[Row], opts: &Options) -> usize {
     let title = info.user.chars().count() + 1 + info.host.chars().count();
     let rows = rows
         .iter()
         .map(|r| r.label.len() + 2 + bar_cols(r, opts) + r.text.chars().count());
     let swatches = opts.swatches.iter().map(|row| row.len() * SWATCH_COLS);
-    rows.chain(swatches).chain([title]).max().unwrap_or(0)
+    let bubble = opts.quip.iter().map(|q| quip::bubble_cols(q, true));
+    rows.chain(swatches)
+        .chain(bubble)
+        .chain([title])
+        .max()
+        .unwrap_or(0)
 }
 
 /// Background colour codes for each swatch row. There are none without colour.
@@ -220,13 +230,15 @@ pub fn swatch_rows(kind: Swatches, palette: &Palette, mode: ColorMode) -> Vec<Ve
 }
 
 /// The info column: the title, then a "Label: value" line per row (with a
-/// usage bar where there is one), then the swatch rows. Lines are truncated
-/// to `max_cols`.
+/// usage bar where there is one), then the swatch rows and the quip's speech
+/// bubble, its tail pointing left if `tail`. Lines are truncated to
+/// `max_cols`; a bubble that can't be is left out.
 pub fn info_lines(
     info: &Info,
     rows: &[Row],
     opts: &Options,
     max_cols: Option<usize>,
+    tail: bool,
 ) -> Vec<String> {
     let (mode, roles) = (opts.mode, opts.roles);
     let title_len = info.user.chars().count() + 1 + info.host.chars().count();
@@ -260,6 +272,13 @@ pub fn info_lines(
     for row in &opts.swatches {
         let row: String = row.iter().map(|code| format!("{code}{block}")).collect();
         lines.push(row + RESET);
+    }
+
+    if let Some(quip) = &opts.quip
+        && let Some(bubble) = quip::bubble(quip, tail, max_cols, mode, roles.muted)
+    {
+        lines.push(String::new());
+        lines.extend(bubble);
     }
     lines
 }
@@ -298,7 +317,7 @@ fn bar(meter: Meter, mode: ColorMode, muted: Rgb) -> String {
     out
 }
 
-fn truncate(s: &str, max: Option<usize>) -> String {
+pub fn truncate(s: &str, max: Option<usize>) -> String {
     match max {
         Some(max) if s.chars().count() > max => {
             let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
@@ -326,9 +345,9 @@ mod tests {
         }
     }
 
-    /// The info column of a default run on the dev machine (WSL2): 52
-    /// columns (the Disk line with its bar) and 20 rows (title and
-    /// separator, 16 modules, a blank line and the palette swatches).
+    /// The info column of a default run on the dev machine (WSL2) without
+    /// the quip: 52 columns (the Disk line with its bar) and 20 rows (title
+    /// and separator, 16 modules, a blank line and the palette swatches).
     const INFO: (usize, usize) = (52, 20);
 
     #[test]
@@ -504,6 +523,7 @@ mod tests {
                 muted: gray,
             },
             swatches: Vec::new(),
+            quip: None,
         }
     }
 
@@ -536,7 +556,13 @@ mod tests {
 
     #[test]
     fn info_column_with_and_without_bars() {
-        let plain = info_lines(&info(), &rows(), &options(ColorMode::None, true), None);
+        let plain = info_lines(
+            &info(),
+            &rows(),
+            &options(ColorMode::None, true),
+            None,
+            false,
+        );
         assert_eq!(
             plain,
             [
@@ -548,12 +574,18 @@ mod tests {
                 "Battery: [#---------] 9% [Discharging]",
             ]
         );
-        let no_bars = info_lines(&info(), &rows(), &options(ColorMode::None, false), None);
+        let no_bars = info_lines(
+            &info(),
+            &rows(),
+            &options(ColorMode::None, false),
+            None,
+            false,
+        );
         assert_eq!(no_bars[3], "Memory: 2.00 GiB / 16.00 GiB (12%)");
         assert_eq!(no_bars[5], "Battery: 9% [Discharging]");
 
         let opts = options(ColorMode::TrueColor, true);
-        let lines = info_lines(&info(), &rows(), &opts, None);
+        let lines = info_lines(&info(), &rows(), &opts, None, false);
         let label = |l: &str| ColorMode::TrueColor.paint(l, Rgb(128, 128, 128));
         let muted = "\x1b[38;2;128;128;128m";
         assert_eq!(
@@ -574,11 +606,85 @@ mod tests {
                 "Memory: ".len() + bar + "2.00 GiB / 16.00 GiB (12%)".len()
             );
             // The bar stays whole; the text makes room.
-            let lines = info_lines(&info(), &rows(), &opts, Some(8 + bar + 9));
+            let lines = info_lines(&info(), &rows(), &opts, Some(8 + bar + 9), false);
             assert!(lines[3].ends_with("] 2.00 GiB…") || lines[3].ends_with("m 2.00 GiB…"));
             assert!(lines[2].ends_with(": 6.6.87"), "short lines stay whole");
         }
         let opts = options(ColorMode::None, false);
         assert_eq!(natural_width(&info(), &rows(), &opts), 34);
+    }
+
+    fn with_quip(mut opts: Options, quip: &str) -> Options {
+        opts.quip = Some(quip.into());
+        opts
+    }
+
+    #[test]
+    fn the_quip_ends_the_column() {
+        let opts = with_quip(options(ColorMode::None, true), "what.");
+        let lines = info_lines(&info(), &rows(), &opts, None, true);
+        assert_eq!(lines[6..], ["", " +-------+", "-| what. |", " +-------+"]);
+        let lines = info_lines(&info(), &rows(), &opts, None, false);
+        assert_eq!(lines[6..], ["", "+-------+", "| what. |", "+-------+"]);
+
+        // After the swatches, with a blank row between them.
+        let mut opts = with_quip(options(ColorMode::TrueColor, true), "what.");
+        let swatch = "\x1b[48;2;9;9;9m";
+        opts.swatches = vec![vec![swatch.into()]];
+        let lines = info_lines(&info(), &rows(), &opts, None, true);
+        let muted = "\x1b[38;2;128;128;128m";
+        assert_eq!(
+            lines[6..],
+            [
+                String::new(),
+                format!("{swatch}   {RESET}"),
+                String::new(),
+                format!(" {muted}╭───────╮{RESET}"),
+                format!("{muted}─┤{RESET} what. {muted}│{RESET}"),
+                format!(" {muted}╰───────╯{RESET}"),
+            ]
+        );
+        opts.quip = None;
+        assert_eq!(info_lines(&info(), &rows(), &opts, None, true).len(), 8);
+    }
+
+    #[test]
+    fn the_quip_counts_toward_the_width() {
+        // 40 characters, wider than any row.
+        let quip = "a remark wider than any row of the info.";
+        let opts = with_quip(options(ColorMode::None, false), quip);
+        assert_eq!(natural_width(&info(), &rows(), &opts), 45, "with its tail");
+        // Squeezed, the text is cut short...
+        let lines = info_lines(&info(), &rows(), &opts, Some(20), true);
+        assert_eq!(lines[lines.len() - 2], "-| a remark wider… |");
+        assert!(lines.iter().all(|l| l.chars().count() <= 20), "{lines:?}");
+        // ...and too narrow for a 12-column bubble, it goes, with its blank row.
+        let lines = info_lines(&info(), &rows(), &opts, Some(11), true);
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert_eq!(
+            natural_width(&info(), &rows(), &options(ColorMode::None, false)),
+            34
+        );
+    }
+
+    #[test]
+    fn the_bubble_points_at_a_logo_beside_it() {
+        let mut opts = with_quip(options(ColorMode::None, true), "what.");
+        opts.logo = Some(Style::Ascii);
+        let logo = LogoImage::embedded();
+        // Not a terminal: side by side.
+        let side = render(&info(), &logo, &opts, None);
+        assert!(side.contains("   -| what. |\n"), "{side}");
+        opts.layout = Layout::Stacked;
+        let stacked = render(&info(), &logo, &opts, None);
+        assert!(
+            stacked.ends_with("\n+-------+\n| what. |\n+-------+\n\n"),
+            "{stacked}"
+        );
+        opts.logo = None;
+        assert_eq!(
+            render(&info(), &logo, &opts, None),
+            "me@box\n------\n\n+-------+\n| what. |\n+-------+\n\n"
+        );
     }
 }

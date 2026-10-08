@@ -41,12 +41,15 @@ fn stderr_lines(out: &Output) -> Vec<String> {
 
 /// The parts of the output that don't change between runs: each line up to its
 /// first reset (the whole logo row; piped output uses the 48-column logo, which
-/// is taller than the info column) and the themed title. The info values are
-/// live (uptime, memory) and can differ from one run to the next.
+/// is usually taller than the info column) and the themed title. The info
+/// values are live (uptime, memory) and can differ from one run to the next,
+/// and so can the quip: the edges of its bubble are left out, in case they
+/// are below the logo.
 fn stable_parts(out: &Output) -> Vec<String> {
     let text = stdout(out);
     let mut parts: Vec<String> = text
         .lines()
+        .filter(|l| !l.contains('╭') && !l.contains('╰'))
         .filter_map(|l| l.split_once(RESET).map(|(logo, _)| logo.to_string()))
         .collect();
     parts.extend(
@@ -199,6 +202,7 @@ fn help_lists_the_new_options() {
         "--layout",
         "--modules",
         "--no-bars",
+        "--no-quip",
     ] {
         assert!(help.contains(option), "{option} missing from --help");
     }
@@ -249,6 +253,47 @@ fn usage_bars_and_no_bars() {
     let (out, lines) = plain_lines(&cache, &["--no-bars"]);
     assert!(out.status.success());
     assert!(memory(&lines).ends_with("%)") && !memory(&lines).contains('['));
+}
+
+#[test]
+fn quip_bubble_and_no_quip() {
+    let cache = temp_dir("quip");
+    // No colour and no logo: an ASCII bubble without a tail, after a blank row
+    // (and before the output's trailing blank line).
+    let (out, lines) = plain_lines(&cache, &[]);
+    assert!(out.status.success());
+    let [blank, top, middle, bottom, end] = &lines[lines.len() - 5..] else {
+        panic!("{lines:?}");
+    };
+    assert_eq!((blank.as_str(), end.as_str()), ("", ""));
+    assert!(top.starts_with("+-") && top.ends_with("-+"), "{lines:?}");
+    assert_eq!(top, bottom);
+    assert!(
+        middle.starts_with("| ") && middle.ends_with(" |"),
+        "{lines:?}"
+    );
+    assert_eq!(middle.chars().count(), top.chars().count());
+    let quip = &middle[2..middle.len() - 2];
+    assert!(!quip.is_empty() && quip.chars().count() <= 40, "{quip:?}");
+    assert_eq!(quip, quip.to_lowercase());
+
+    let (out, lines) = plain_lines(&cache, &["--no-quip"]);
+    assert!(out.status.success());
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with('+') || l.starts_with('|')),
+        "{lines:?}"
+    );
+
+    // In colour beside the logo (auto's choice in a pipe), the bubble is
+    // rounded and its tail points at the logo.
+    let text = stdout(&ffetch(&cache, &[]));
+    for piece in ["╭", "─┤", "╯"] {
+        assert!(text.contains(piece), "{piece} missing:\n{text}");
+    }
+    let text = stdout(&ffetch(&cache, &["--no-quip"]));
+    assert!(!text.contains('╭') && !text.contains("─┤"), "{text}");
 }
 
 #[test]

@@ -41,6 +41,8 @@ pub struct Fixture {
     pub cwd: Option<PathBuf>,
     pub ppid: u32,
     pub uid: u32,
+    /// The hour of the local time.
+    pub hour: Option<u8>,
     /// Every path read, in order (shared, so it can be checked after the
     /// fixture moves into a `Ctx`).
     pub reads: Arc<Mutex<Vec<PathBuf>>>,
@@ -84,6 +86,7 @@ impl Fixture {
             cwd: None,
             ppid: 1,
             uid: 1000,
+            hour: None,
             reads: Arc::default(),
         }
     }
@@ -114,6 +117,13 @@ impl Fixture {
                 "uid" => fixture.uid = number(key, value),
                 "cwd" => fixture.cwd = Some(value.into()),
                 _ => panic!("process: unknown key {key:?}"),
+            }
+        }
+
+        for (key, value) in pairs(&file("clock")) {
+            match key {
+                "hour" => fixture.hour = Some(number(key, value)),
+                _ => panic!("clock: unknown key {key:?}"),
             }
         }
 
@@ -373,6 +383,10 @@ impl System for Fixture {
             (fields.nth(1)?.parse() == Ok(uid)).then(|| name.to_string())
         })
     }
+
+    fn local_hour(&self) -> Option<u8> {
+        self.hour
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +396,7 @@ mod tests {
         info::{Info, Report, Value, collect, default_modules, value::Field},
         layout::{self, Layout, Options},
         palette::Roles,
+        quip::{self, State},
         term::{ColorMode, Rgb},
     };
 
@@ -393,8 +408,16 @@ mod tests {
         collect(&ctx(Fixture::load(name)), &default_modules())
     }
 
-    /// The info column as `--no-color` prints it.
-    fn plain_text(info: &Info) -> String {
+    /// Picks the quip in snapshots, so that they don't change between runs:
+    /// the first of three templates.
+    const QUIP_SEED: u64 = 3;
+
+    /// The info column of the fixture `name` as `--no-color` prints it
+    /// without a logo.
+    fn plain_text(name: &str) -> String {
+        let ctx = ctx(Fixture::load(name));
+        let info = collect(&ctx, &default_modules());
+        let quip = quip::pick(&quip::built_in(), &State::new(&info, &ctx), QUIP_SEED);
         let gray = Rgb(128, 128, 128);
         let opts = Options {
             logo: None,
@@ -408,8 +431,9 @@ mod tests {
                 muted: gray,
             },
             swatches: Vec::new(),
+            quip,
         };
-        let lines = layout::info_lines(info, &info.rows(), &opts, None);
+        let lines = layout::info_lines(&info, &info.rows(), &opts, None, false);
         lines.join("\n") + "\n"
     }
 
@@ -461,12 +485,12 @@ mod tests {
 
     #[test]
     fn wsl2_snapshot() {
-        assert_snapshot("wsl2", &plain_text(&fetch("wsl2")));
+        assert_snapshot("wsl2", &plain_text("wsl2"));
     }
 
     #[test]
     fn arch_desktop_snapshot() {
-        assert_snapshot("arch-desktop", &plain_text(&fetch("arch-desktop")));
+        assert_snapshot("arch-desktop", &plain_text("arch-desktop"));
     }
 
     #[test]
@@ -538,6 +562,90 @@ mod tests {
         assert_eq!(field(&info, "git", "ahead"), int(1));
         assert_eq!(field(&info, "git", "behind"), int(0));
         assert_eq!(field(&info, "git", "changed"), int(3));
+    }
+
+    fn quip_state(fixture: Fixture, ids: &[&str]) -> State {
+        let ctx = ctx(fixture);
+        State::new(&collect(&ctx, ids), &ctx)
+    }
+
+    #[test]
+    fn quip_states() {
+        let wsl2 = quip_state(Fixture::load("wsl2"), &default_modules());
+        assert_eq!(
+            wsl2,
+            State {
+                battery: Some(100),
+                battery_discharging: Some(false),
+                mem_pct: Some(16),
+                disk_pct: Some(8),
+                load1: Some(0.14),
+                threads: Some(16),
+                uptime_days: Some(0),
+                hour: Some(2),
+                root: Some(false),
+                packages: Some(6),
+            }
+        );
+        let arch = quip_state(Fixture::load("arch-desktop"), &default_modules());
+        assert_eq!(
+            arch,
+            State {
+                battery: None,
+                battery_discharging: None,
+                mem_pct: Some(16),
+                disk_pct: Some(40),
+                load1: Some(2.31),
+                threads: Some(32),
+                uptime_days: Some(11),
+                hour: Some(14),
+                root: Some(false),
+                packages: Some(10),
+            }
+        );
+
+        // Root at noon: nothing else to remark on.
+        let mut fixture = Fixture::load("wsl2");
+        fixture.uid = 0;
+        fixture.hour = Some(12);
+        let root = quip_state(fixture, &default_modules());
+        assert_eq!((root.root, root.hour), (Some(true), Some(12)));
+        let quip = quip::pick(&quip::built_in(), &root, QUIP_SEED).unwrap();
+        assert!(quip.contains("root"), "{quip}");
+
+        // Modules that didn't run leave their names undefined. Without the
+        // load module, the thread count comes from the CPU.
+        let mut fixture = Fixture::load("wsl2");
+        fixture.hour = None;
+        assert_eq!(
+            quip_state(fixture, &["os", "cpu"]),
+            State {
+                threads: Some(16),
+                root: Some(false),
+                ..State::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_discharging_battery() {
+        let tree = Tree::new(
+            "discharging",
+            &[
+                ("/sys/class/power_supply/BAT0/type", "Battery\n"),
+                ("/sys/class/power_supply/BAT0/capacity", "9\n"),
+                ("/sys/class/power_supply/BAT0/status", "Discharging\n"),
+            ],
+        );
+        let ctx = tree.ctx();
+        let state = State::new(&collect(&ctx, &["battery"]), &ctx);
+        assert_eq!(
+            (state.battery, state.battery_discharging),
+            (Some(9), Some(true))
+        );
+        assert_eq!(state.hour, None, "no clock in a bare fixture");
+        let quip = quip::pick(&quip::built_in(), &state, QUIP_SEED).unwrap();
+        assert_eq!(quip, "9% battery. living dangerously.");
     }
 
     const OPT_IN: [&str; 4] = ["toolchains", "docker", "ip", "updates"];

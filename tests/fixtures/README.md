@@ -3,7 +3,7 @@
 Each directory here is a fake machine. The fixture tests in
 `src/info/fixture.rs` run the info modules against it in place of the real
 system (through `info::System`). Then they compare the plain `--no-color` info
-column with `expected.txt`.
+column with `expected.txt`, quip included (picked with a fixed seed).
 
 ```
 <name>/
@@ -11,6 +11,7 @@ column with `expected.txt`.
   env            environment variables, KEY=VALUE per line (only these are set)
   uname          nodename=, release=, machine=
   process        ppid= (where the Terminal walk starts), uid=, cwd= (for Git)
+  clock          hour= (the local time's hour, 0-23, for quips)
   statvfs        one line per path: / frsize=4096 blocks=… bfree=… bavail=…
   interfaces     getifaddrs, one address per line: eth0 192.168.1.20 up,running
   commands/      canned program runs, one file each (any name)
@@ -18,10 +19,10 @@ column with `expected.txt`.
   expected.txt   the snapshot
 ```
 
-In `env`, `uname`, `process`, `statvfs` and `interfaces`, blank lines and lines
-starting with `#` are ignored. The flags in `interfaces` are any of `up`,
-`running` and `loopback`, comma-separated (`-` for none); only IPv4 and IPv6
-addresses are listed, in `getifaddrs` order.
+In `env`, `uname`, `process`, `clock`, `statvfs` and `interfaces`, blank
+lines and lines starting with `#` are ignored. The flags in `interfaces` are
+any of `up`, `running` and `loopback`, comma-separated (`-` for none); only
+IPv4 and IPv6 addresses are listed, in `getifaddrs` order.
 
 Under `root/`, use plain files and directories, never symlinks. A directory
 that has to exist but would be empty, such as a pacman package directory,
@@ -98,7 +99,8 @@ the rewritten files with `git diff`.
   WSL, it has no CPU temperature sensors (only the AC adapter and battery
   in hwmon), and no Docker socket. Its interfaces include the private
   address WSL's DNS tunnel puts on `lo`, and update-notifier reports 15
-  updates, 5 of them security updates.
+  updates, 5 of them security updates. Its clock says 2am, so the quip
+  tells you to go to sleep.
 - **arch-desktop**: synthetic Arch Linux with KDE Plasma on Wayland. It has
   pacman and flatpak packages, a DMI model, two connected DRM outputs, an
   NVIDIA and an AMD GPU, a Ryzen 7950X with a cpufreq maximum, and no
@@ -106,4 +108,5 @@ the rewritten files with `git diff`.
   parent chain. hwmon has an NVMe and an amdgpu sensor around `k10temp`.
   The working directory is a git checkout one commit ahead of its upstream
   with 3 changed files. `rustc`, `node` and `python3` are canned, and the
-  Docker socket lists 3 running containers.
+  Docker socket lists 3 running containers. It's 2pm, 11 days after the
+  boot, which is what the quip is about.

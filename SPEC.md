@@ -211,20 +211,22 @@ Default order for the info column: OS, Host, Windows, Kernel, Uptime, Packages, 
    ╰──────────────────────────────────╯
   ```
 
-  In no-color mode the bubble is drawn with `+ - |`.
-- Rules are checked in priority order and the first match wins. Each rule has several templates; one is picked at random per run, seeded from the clock. Placeholders are filled from module data.
+  In no-color mode the bubble is drawn with `+ - |`. Without a logo beside it (stacked or no logo) there is no tail. The border uses the `muted` role. On a narrow column the text is truncated with `…`, and the bubble is dropped if it would be narrower than 12 columns.
+- Rules are checked in priority order and the first match wins (user rules first). Each rule has several templates; one is picked at random per run, seeded from the clock. Placeholders are filled from module data.
 
-| Priority | Condition | Example templates |
+| Priority | Condition (`when`) | Templates |
 |----------|-----------|-------------------|
-| 1 | Battery < 15% and discharging | `{battery}% battery. living dangerously.` · `plug me in.` |
-| 2 | Memory ≥ 90% | `{mem_pct}% RAM. what are you doing.` |
-| 3 | Disk ≥ 90% | `disk's {disk_pct}% full. delete something.` |
-| 4 | 1-minute load > thread count | `load {load1} on {threads} threads. breathe.` |
-| 5 | Uptime ≥ 7 days | `{uptime_days} days without a reboot. bold.` |
-| 6 | Local time 00:00–04:59 | `it's {hour}am. go to sleep.` |
-| 7 | Running as root | `running a fetch as root. sure.` |
-| 8 | Packages > 3000 | `{packages} packages. hoarder.` |
-| 9 | Fallback | `what.` · `fine. here are your stats.` · `don't screenshot me.` |
+| 1 | `battery < 15 and battery_discharging == 1` | `{battery}% battery. living dangerously.` · `plug me in.` · `{battery}% left. find a charger.` |
+| 2 | `mem_pct >= 90` | `{mem_pct}% ram. i'm drowning.` · `memory's at {mem_pct}%. close a tab.` · `{mem_pct}% memory used. i can't think.` |
+| 3 | `disk_pct >= 90` | `disk's {disk_pct}% full. delete something.` · `disk at {disk_pct}%. no room for anything.` |
+| 4 | `load_ratio > 1` | `load {load1} on {threads} threads. breathe.` · `load {load1}. one thing at a time.` · `everything at once? load {load1}.` |
+| 5 | `uptime_days >= 7` | `{uptime_days} days without a reboot. bold.` · `up {uptime_days} days. i could use a nap.` · `{uptime_days} days up. reboot me already.` |
+| 6 | `hour < 5` | `it's {clock}. go to sleep.` · `it's {clock}. let me sleep.` · `{clock}. nothing good happens now.` |
+| 7 | `root == 1` | `running a fetch as root. sure.` · `root? for a fetch? fine.` |
+| 8 | `packages > 3000` | `{packages} packages. i'm stuffed.` · `{packages} packages. i'm full.` · `{packages} packages and counting. ugh.` |
+| 9 | always | `what.` · `fine. here are your stats.` · `don't screenshot me.` |
+
+Conditions use a small language: `<name> <op> <number>` joined by `and`, with ops `< <= > >= == !=`. Built-in and user rules share it. Names: `battery`, `battery_discharging` (0/1), `mem_pct`, `disk_pct`, `load1`, `threads`, `load_ratio` (load1 / threads), `uptime_days`, `hour` (0–23), `root` (0/1), `packages`. A name whose module didn't run or had no value is undefined, and any condition using it is false. Unknown names and placeholders are parse errors. In templates, `{clock}` renders the hour as `2am`/`12pm`, `{packages}` gets thousands separators, and `{load1}` one decimal.
 
 - Tone: grumpy, at most 40 characters, lowercase. No profanity, and never about the user as a person — only about the machine.
 - On by default. Disable with `--no-quip` or config `quip = false`. Users can override or extend rules with `[[quip.rule]]` tables in the config (they take priority over the built-ins).

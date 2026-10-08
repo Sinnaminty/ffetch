@@ -5,6 +5,8 @@ mod info;
 mod layout;
 mod logo;
 mod palette;
+mod quip;
+mod rng;
 mod socket;
 mod term;
 mod wsl;
@@ -35,6 +37,7 @@ Options:
       --modules <ids>    Show these modules, in this order, e.g. os,load,git,ip
       --swatches <kind>  Color swatches: palette (default), ansi, none
       --no-bars          Hide the usage bars of memory, disk and battery
+      --no-quip          Hide the character's remark under the info
       --no-color         Disable colors (NO_COLOR is honored too)
       --refresh          Recompute the facts cached until the next boot
   -h, --help             Show this help
@@ -52,6 +55,8 @@ struct Args {
     modules: Option<String>,
     swatches: Swatches,
     bars: bool,
+    /// Show a quip under the info.
+    quip: bool,
     /// Recompute the facts cached per boot.
     refresh: bool,
 }
@@ -67,6 +72,7 @@ fn parse_args() -> Result<Args, String> {
         modules: None,
         swatches: Swatches::Palette,
         bars: true,
+        quip: true,
         refresh: false,
     };
     let mut argv = std::env::args().skip(1);
@@ -88,6 +94,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--no-color" => args.no_color = true,
             "--no-bars" => args.bars = false,
+            "--no-quip" => args.quip = false,
             "-l" | "--logo" => {
                 args.logo = match value().as_deref() {
                     Some("ascii") => Some(Style::Ascii),
@@ -188,6 +195,15 @@ fn main() {
     };
     let image = load_image(&args);
     let palette = palette::extract(&image.pixels, image.background);
+    let ctx = info::Ctx::live(args.refresh);
+    let sys = info::collect(&ctx, &ids);
+    let quip = match args.quip {
+        true => {
+            let state = quip::State::new(&sys, &ctx);
+            quip::pick(&quip::built_in(), &state, quip::clock_seed())
+        }
+        false => None,
+    };
     let opts = Options {
         logo: args.logo,
         size: args.size,
@@ -196,9 +212,8 @@ fn main() {
         mode,
         roles: Theme::default().roles(&palette),
         swatches: layout::swatch_rows(args.swatches, &palette, mode),
+        quip,
     };
-    let ctx = info::Ctx::live(args.refresh);
-    let sys = info::collect(&ctx, &ids);
     let out = layout::render(&sys, &image, &opts, term::size());
     // Ignore errors such as a closed pipe (`ffetch | head`).
     let _ = io::stdout().lock().write_all(out.as_bytes());

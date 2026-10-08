@@ -50,6 +50,8 @@ pub trait System: Send + Sync {
     /// The login name of `uid` in the passwd database. Not thread-safe: only
     /// called before the module threads start.
     fn user_name(&self, uid: u32) -> Option<String>;
+    /// The hour of the local time, 0-23.
+    fn local_hour(&self) -> Option<u8>;
 }
 
 /// A directory entry.
@@ -218,6 +220,18 @@ impl System for Live {
                 .into_owned(),
         )
     }
+
+    fn local_hour(&self) -> Option<u8> {
+        // SAFETY: time with a null pointer only returns the time, and
+        // localtime_r only fills in the zeroed struct (reading the time zone
+        // from TZ or /etc/localtime the first time).
+        let now = unsafe { libc::time(std::ptr::null_mut()) };
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
+            return None;
+        }
+        u8::try_from(tm.tm_hour).ok()
+    }
 }
 
 /// The IPv4 or IPv6 address in `sa`; `None` for other families.
@@ -248,7 +262,6 @@ pub struct User {
 }
 
 impl User {
-    #[cfg_attr(not(test), expect(dead_code, reason = "for quips (M5)"))]
     pub fn is_root(&self) -> bool {
         self.uid == 0
     }
@@ -385,6 +398,11 @@ impl Ctx {
 
     pub fn ppid(&self) -> u32 {
         self.sys.ppid()
+    }
+
+    /// The hour of the local time, 0-23.
+    pub fn local_hour(&self) -> Option<u8> {
+        self.sys.local_hour()
     }
 
     /// `/proc/meminfo`, trimmed. Read at most once per run.
