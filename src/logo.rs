@@ -89,7 +89,7 @@ impl From<Image> for LogoImage {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Style {
     Ascii,
     Blocks,

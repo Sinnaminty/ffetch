@@ -8,6 +8,23 @@ pub const BOLD: &str = "\x1b[1m";
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
+impl Rgb {
+    /// "#c33e58": lowercase, as in the JSON output and the config file.
+    pub fn hex(self) -> String {
+        format!("#{:02x}{:02x}{:02x}", self.0, self.1, self.2)
+    }
+
+    /// Parses "#rrggbb", in either case.
+    pub fn from_hex(s: &str) -> Option<Rgb> {
+        let digits = s.strip_prefix('#')?;
+        if digits.len() != 6 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let channel = |i: usize| u8::from_str_radix(&digits[i..i + 2], 16).ok();
+        Some(Rgb(channel(0)?, channel(2)?, channel(4)?))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ColorMode {
     None,
@@ -116,6 +133,20 @@ mod tests {
         // Greys go to the grey ramp rather than the coarser cube.
         assert_eq!(to_ansi256(Rgb(128, 128, 128)), 244);
         assert_eq!(to_ansi256(Rgb(0xc3, 0x3e, 0x58)), 131);
+    }
+
+    #[test]
+    fn hex_colors() {
+        assert_eq!(Rgb(0xc3, 0x3e, 0x58).hex(), "#c33e58");
+        assert_eq!(Rgb(0, 0, 0).hex(), "#000000");
+        assert_eq!(Rgb::from_hex("#c33e58"), Some(Rgb(0xc3, 0x3e, 0x58)));
+        assert_eq!(Rgb::from_hex("#C33E58"), Some(Rgb(0xc3, 0x3e, 0x58)));
+        for bad in [
+            "", "#", "c33e58", "#c33e5", "#c33e588", "#c33e5g", "#+3e58a", "red", "#c3 e58",
+            "#ｃ33e5",
+        ] {
+            assert_eq!(Rgb::from_hex(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

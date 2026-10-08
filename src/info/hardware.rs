@@ -9,7 +9,9 @@ use std::{
 use super::{
     Ctx,
     ctx::IfAddr,
-    value::{Batteries, Battery, Cpu, Gpus, Load, LocalIp, Name, Temp, Usage, Value},
+    value::{
+        Batteries, Battery, Cpu, Gpu, GpuSource, Gpus, Load, LocalIp, Name, Temp, Usage, Value,
+    },
 };
 use crate::wsl::{self, Wsl};
 
@@ -156,18 +158,18 @@ fn loadavg(text: &str) -> Option<[f64; 3]> {
 }
 
 pub fn gpu(ctx: &Ctx) -> Option<Value> {
-    gpu_names(ctx).map(|names| Value::Gpu(Gpus { names }))
+    // On WSL the PCI scan only finds the virtual "Microsoft Basic Render Driver".
+    let wsl_gpus = || {
+        let fact = ctx.cached(wsl::GPU_FACT, || wsl::gpus(ctx))?;
+        wsl::parse_gpus(&fact)
+    };
+    let gpus = ctx.wsl.and_then(|_| wsl_gpus()).or_else(|| pci_gpus(ctx))?;
+    Some(Value::Gpu(Gpus { gpus }))
 }
 
-fn gpu_names(ctx: &Ctx) -> Option<Vec<String>> {
-    // On WSL the PCI scan only finds the virtual "Microsoft Basic Render Driver".
-    if ctx.wsl.is_some()
-        && let Some(gpus) = ctx.cached("gpu", || wsl::gpus(ctx))
-    {
-        return Some(gpus.lines().map(str::to_string).collect());
-    }
+fn pci_gpus(ctx: &Ctx) -> Option<Vec<Gpu>> {
     let mut pci_ids: Option<Option<String>> = None;
-    let mut gpus: Vec<String> = Vec::new();
+    let mut gpus: Vec<Gpu> = Vec::new();
     for dev in ctx.sorted_dir("/sys/bus/pci/devices") {
         // PCI class 0x03xxxx = display controller.
         if !ctx
@@ -192,28 +194,30 @@ fn gpu_names(ctx: &Ctx) -> Option<Vec<String>> {
             .iter()
             .find_map(|p| ctx.read_full(p))
         });
-        let name = gpu_name(ids.as_deref(), &vendor, &device);
-        if !gpus.contains(&name) {
-            gpus.push(name);
+        let gpu = pci_gpu(ids.as_deref(), &vendor, &device);
+        if !gpus.contains(&gpu) {
+            gpus.push(gpu);
         }
     }
     (!gpus.is_empty()).then_some(gpus)
 }
 
-fn gpu_name(ids: Option<&str>, vendor: &str, device: &str) -> String {
+/// The GPU with these PCI IDs. Without a vendor name (from the short list
+/// below or pci.ids), the vendor ID is shown as part of the name.
+fn pci_gpu(ids: Option<&str>, vendor: &str, device: &str) -> Gpu {
     let (vendor_name, device_name) = ids
         .map(|ids| pci_lookup(ids, vendor, device))
         .unwrap_or_default();
-    let vendor = match vendor {
-        "10de" => "NVIDIA",
-        "1002" => "AMD",
-        "8086" => "Intel",
-        "1414" => "Microsoft",
-        "15ad" => "VMware",
-        "80ee" => "VirtualBox",
-        "1af4" => "Red Hat",
-        "1234" => "QEMU",
-        _ => vendor_name.as_deref().unwrap_or(vendor),
+    let known = match vendor {
+        "10de" => Some("NVIDIA"),
+        "1002" => Some("AMD"),
+        "8086" => Some("Intel"),
+        "1414" => Some("Microsoft"),
+        "15ad" => Some("VMware"),
+        "80ee" => Some("VirtualBox"),
+        "1af4" => Some("Red Hat"),
+        "1234" => Some("QEMU"),
+        _ => None,
     };
     // "GA102 [GeForce RTX 3080]" -> "GeForce RTX 3080"
     let model = match device_name {
@@ -223,7 +227,18 @@ fn gpu_name(ids: Option<&str>, vendor: &str, device: &str) -> String {
         },
         None => format!("Device {device}"),
     };
-    format!("{vendor} {model}")
+    match known.map(str::to_string).or(vendor_name) {
+        Some(vendor) => Gpu {
+            vendor: Some(vendor),
+            name: model,
+            source: GpuSource::Pci,
+        },
+        None => Gpu {
+            vendor: None,
+            name: format!("{vendor} {model}"),
+            source: GpuSource::Pci,
+        },
+    }
 }
 
 /// Looks up vendor and device names in a pci.ids database.
@@ -356,13 +371,33 @@ mod tests {
 
     #[test]
     fn gpu_names_from_pci_ids() {
+        let gpu = |ids, vendor, device| {
+            let gpu = pci_gpu(ids, vendor, device);
+            assert_eq!(gpu.source, GpuSource::Pci);
+            (gpu.vendor.clone(), gpu.name.clone(), gpu.full_name())
+        };
+        let named = |vendor: &str, name: &str| {
+            (
+                Some(vendor.to_string()),
+                name.to_string(),
+                format!("{vendor} {name}"),
+            )
+        };
         assert_eq!(
-            gpu_name(Some(IDS), "10de", "2684"),
-            "NVIDIA GeForce RTX 4090"
+            gpu(Some(IDS), "10de", "2684"),
+            named("NVIDIA", "GeForce RTX 4090")
         );
-        assert_eq!(gpu_name(Some(IDS), "1002", "164e"), "AMD Raphael");
-        assert_eq!(gpu_name(Some(IDS), "1002", "1234"), "AMD Device 1234");
-        assert_eq!(gpu_name(None, "abcd", "0001"), "abcd Device 0001");
+        assert_eq!(gpu(Some(IDS), "1002", "164e"), named("AMD", "Raphael"));
+        assert_eq!(gpu(Some(IDS), "1002", "1234"), named("AMD", "Device 1234"));
+        // A vendor only pci.ids knows.
+        let ids = "1a03  ASPEED Technology, Inc.\n\t2000  ASPEED Graphics Family\n";
+        assert_eq!(
+            gpu(Some(ids), "1a03", "2000"),
+            named("ASPEED Technology, Inc.", "ASPEED Graphics Family")
+        );
+        // No name for the vendor at all.
+        let unknown = "abcd Device 0001".to_string();
+        assert_eq!(gpu(None, "abcd", "0001"), (None, unknown.clone(), unknown));
     }
 
     #[test]

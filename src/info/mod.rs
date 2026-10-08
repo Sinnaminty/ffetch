@@ -10,14 +10,18 @@ mod dev;
 mod fixture;
 mod hardware;
 mod software;
-mod value;
+pub mod value;
 
 use std::thread;
 
 pub use ctx::{Ctx, System};
 #[cfg(test)]
 pub use value::Gauge;
-pub use value::{Field, Level, Meter, Report, Value};
+use value::{
+    Batteries, Containers, Cpu, Git, Gpus, Kernel, Load, LocalIp, Name, Os, Packages, Resolution,
+    Shell, Temp, Toolchains, Updates, Uptime, Usage, Windows,
+};
+pub use value::{Field, Gpu, GpuSource, Level, Meter, Report, Value};
 
 /// How expensive a module is to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,13 +39,17 @@ pub struct ModuleDef {
     pub id: &'static str,
     /// The label shown before the value.
     pub label: &'static str,
+    /// Documents the R1 budget; only the tests check it so far.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "for the config file and --format (M6)")
+        expect(dead_code, reason = "nothing chooses modules by cost at runtime")
     )]
     pub cost: Cost,
     /// Whether it runs without being asked for.
     pub default_on: bool,
+    /// The names `Report::field` answers to for its values, which
+    /// `{id.field}` placeholders (`--format`) may use.
+    pub fields: &'static [&'static str],
     /// `None` when it has nothing to report.
     pub run: fn(&Ctx) -> Option<Value>,
 }
@@ -51,6 +59,7 @@ const fn module(
     id: &'static str,
     label: &'static str,
     cost: Cost,
+    fields: &'static [&'static str],
     run: fn(&Ctx) -> Option<Value>,
 ) -> ModuleDef {
     ModuleDef {
@@ -58,6 +67,7 @@ const fn module(
         label,
         cost,
         default_on: true,
+        fields,
         run,
     }
 }
@@ -67,47 +77,49 @@ const fn opt_in(
     id: &'static str,
     label: &'static str,
     cost: Cost,
+    fields: &'static [&'static str],
     run: fn(&Ctx) -> Option<Value>,
 ) -> ModuleDef {
     ModuleDef {
         default_on: false,
-        ..module(id, label, cost, run)
+        ..module(id, label, cost, fields, run)
     }
 }
 
 /// Every module: the default ones in display order, then the opt-in ones.
+#[rustfmt::skip]
 pub static MODULES: &[ModuleDef] = &[
-    module("os", "OS", Cost::Fast, software::os),
+    module("os", "OS", Cost::Fast, Os::FIELDS, software::os),
     // `wslinfo` on WSL, ~1 ms.
-    module("host", "Host", Cost::Spawn, hardware::host),
+    module("host", "Host", Cost::Spawn, Name::FIELDS, hardware::host),
     // `cmd.exe`, cached per boot; only on WSL.
-    module("windows", "Windows", Cost::Slow, software::windows),
-    module("kernel", "Kernel", Cost::Fast, software::kernel),
-    module("uptime", "Uptime", Cost::Fast, software::uptime),
+    module("windows", "Windows", Cost::Slow, Windows::FIELDS, software::windows),
+    module("kernel", "Kernel", Cost::Fast, Kernel::FIELDS, software::kernel),
+    module("uptime", "Uptime", Cost::Fast, Uptime::FIELDS, software::uptime),
     // The dpkg database is big, and `rpm -qa` is a program.
-    module("packages", "Packages", Cost::Spawn, software::packages),
-    module("shell", "Shell", Cost::Spawn, software::shell),
-    module("resolution", "Resolution", Cost::Fast, desktop::resolution),
-    module("de", "DE", Cost::Fast, desktop::de),
-    module("wm", "WM", Cost::Fast, desktop::wm),
-    module("terminal", "Terminal", Cost::Fast, desktop::terminal),
-    module("cpu", "CPU", Cost::Fast, hardware::cpu),
-    module("temp", "CPU Temp", Cost::Fast, hardware::temp),
-    module("load", "Load", Cost::Fast, hardware::load),
+    module("packages", "Packages", Cost::Spawn, Packages::FIELDS, software::packages),
+    module("shell", "Shell", Cost::Spawn, Shell::FIELDS, software::shell),
+    module("resolution", "Resolution", Cost::Fast, Resolution::FIELDS, desktop::resolution),
+    module("de", "DE", Cost::Fast, Name::FIELDS, desktop::de),
+    module("wm", "WM", Cost::Fast, Name::FIELDS, desktop::wm),
+    module("terminal", "Terminal", Cost::Fast, Name::FIELDS, desktop::terminal),
+    module("cpu", "CPU", Cost::Fast, Cpu::FIELDS, hardware::cpu),
+    module("temp", "CPU Temp", Cost::Fast, Temp::FIELDS, hardware::temp),
+    module("load", "Load", Cost::Fast, Load::FIELDS, hardware::load),
     // `nvidia-smi` or PowerShell on WSL, cached per boot.
-    module("gpu", "GPU", Cost::Slow, hardware::gpu),
-    module("memory", "Memory", Cost::Fast, hardware::memory),
-    module("disk", "Disk (/)", Cost::Fast, hardware::disk),
-    module("battery", "Battery", Cost::Fast, hardware::battery),
+    module("gpu", "GPU", Cost::Slow, Gpus::FIELDS, hardware::gpu),
+    module("memory", "Memory", Cost::Fast, Usage::FIELDS, hardware::memory),
+    module("disk", "Disk (/)", Cost::Fast, Usage::FIELDS, hardware::disk),
+    module("battery", "Battery", Cost::Fast, Batteries::FIELDS, hardware::battery),
     // `git status`, given 50 ms.
-    module("git", "Git", Cost::Spawn, dev::git),
-    module("locale", "Locale", Cost::Fast, software::locale),
+    module("git", "Git", Cost::Spawn, Git::FIELDS, dev::git),
+    module("locale", "Locale", Cost::Fast, Name::FIELDS, software::locale),
     // rustc, node and python3, at once; 20-30 ms through rustup's proxy.
-    opt_in("toolchains", "Toolchains", Cost::Spawn, dev::toolchains),
-    opt_in("docker", "Containers", Cost::Fast, dev::docker),
+    opt_in("toolchains", "Toolchains", Cost::Spawn, Toolchains::FIELDS, dev::toolchains),
+    opt_in("docker", "Containers", Cost::Fast, Containers::FIELDS, dev::docker),
     // Off by default: people post screenshots.
-    opt_in("ip", "Local IP", Cost::Fast, hardware::ip),
-    opt_in("updates", "Updates", Cost::Fast, software::updates),
+    opt_in("ip", "Local IP", Cost::Fast, LocalIp::FIELDS, hardware::ip),
+    opt_in("updates", "Updates", Cost::Fast, Updates::FIELDS, software::updates),
 ];
 
 /// The module with this id.

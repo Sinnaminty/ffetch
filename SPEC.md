@@ -255,14 +255,18 @@ Conditions use a small language: `<name> <op> <number>` joined by `and`, with op
   }
   ```
 
-- `schema` is incremented on any breaking change. Modules with no value are left out; they are never `null`.
+- `schema` is incremented on any breaking change. Modules with no value, and unknown fields within a value, are left out; they are never `null`.
+- `gpu` entries are `{name, source, vendor?}`: `source` is `pci`, `nvidia-smi` or `powershell`, and `vendor` appears only when known (PCI, nvidia-smi). Other shapes: `packages` is `{total, managers: {dpkg: N, …}}`, `resolution` a list of `{width, height}`, `battery` a list of `{pct, status}`, `toolchains` a map of name to version, `git` has separate `ahead`/`behind`.
+- The palette's role colors are the ones actually painted (after background adjustment and overrides); `colors` are the image's own.
 - Including `palette` means other tools (status bars, terminal themes) can take their colors from the same image.
 
 #### F5.2 One-line output (`--format`, `--oneline`)
 
 - `--format '<template>'` with `{module}` placeholders, e.g. `--format '{os} · up {uptime} · mem {memory.pct}%'`.
 - `--oneline` is a preset: `{os} · up {uptime} · mem {memory.pct}% · disk {disk.pct}%`.
-- Only the modules named in the template are run. Intended for MOTDs, prompts and status bars, so it must meet R1 easily.
+- Only the modules named in the template are run. Intended for MOTDs, prompts and status bars, so it must meet R1 easily (measured: ~1.3 ms for `--oneline`).
+- An unknown module or field is a usage error (exit 2), reported before anything runs. A module with no value at runtime renders as an empty string. `{{` and `}}` are literal braces. Multi-line values are joined with `, `.
+- `--format` and `--oneline` don't read the config file. `--json`, `--format` and `--oneline` are mutually exclusive.
 
 #### F5.3 Config file
 
@@ -274,7 +278,6 @@ Conditions use a small language: `<name> <op> <number>` joined by `and`, with op
 layout = "auto"          # auto | side | stacked
 swatches = "palette"     # palette | ansi | none
 bars = true
-quip = true
 modules = ["os", "host", "windows", "kernel", "uptime", "packages", "shell",
            "terminal", "cpu", "gpu", "memory", "disk", "battery", "git"]
 
@@ -288,12 +291,22 @@ keep_background = false
 background = "dark"      # dark | light
 # accent = "#c33e58"
 
+[quip]                   # or just `quip = false` at the top level
+enabled = true
+
 [[quip.rule]]
 when = "uptime_days >= 30"
 say = ["a month. impressive. concerning."]
 ```
 
-The `when` expressions in user quip rules are limited to `<field> <op> <number>`, with `and` between conditions. Fields are the placeholders from F4. There is no general expression language.
+The `when` expressions in user quip rules use the condition language from F4. A rule without `when` always matches, which replaces the fallback. Bad rules are skipped with a warning naming the rule number; a `say` string over 40 characters warns but is kept.
+
+Error handling (a fetch tool runs at shell startup and must never break it):
+- A missing default config is silent. A missing `--config` path warns once.
+- A TOML syntax error warns once, with `file:line:column`, and the file is ignored.
+- Unknown keys, invalid values and unknown module ids each warn once and fall back to the default for that key.
+- A relative `logo.image` is resolved against the config file's directory; `~` is expanded.
+- `--print-config` writes unset keys as comments, since TOML has no null.
 
 ## 5. Architecture changes
 

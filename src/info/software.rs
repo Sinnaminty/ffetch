@@ -56,6 +56,7 @@ pub fn packages(ctx: &Ctx) -> Option<Value> {
         ctx.read_full(path)
             .map(|s| s.lines().filter(|l| pred(l)).count())
     };
+    // `Packages::FIELDS` lists these names too, for `--format`.
     let counts = [
         (
             "dpkg",

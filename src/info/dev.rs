@@ -232,6 +232,14 @@ mod tests {
     }
 
     #[test]
+    fn each_toolchain_is_a_field() {
+        for (name, _) in TOOLCHAINS {
+            assert!(Toolchains::FIELDS.contains(&name), "{name}");
+        }
+        assert_eq!(Toolchains::FIELDS.len(), TOOLCHAINS.len() + 1, "and count");
+    }
+
+    #[test]
     fn toolchain_versions() {
         let v = |out: &str| tool_version(out);
         assert_eq!(

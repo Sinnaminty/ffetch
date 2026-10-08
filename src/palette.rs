@@ -42,19 +42,17 @@ pub struct Palette {
     pub muted: Rgb,
 }
 
-/// The terminal background that role colours must stand out against.
+/// The terminal background that role colours must stand out against
+/// (`theme.background` in the config file).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Background {
     #[default]
     Dark,
-    // Chosen through the config file once it exists (M6).
-    #[allow(dead_code)]
     Light,
 }
 
-/// How the palette turns into colours on screen. Built-in defaults for now;
-/// the config file fills it in from M6.
-#[derive(Clone, Debug, Default)]
+/// How the palette turns into colours on screen: the config file's `[theme]`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Theme {
     pub background: Background,
     /// Per-role overrides. They are used exactly as given.

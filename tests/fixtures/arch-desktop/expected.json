@@ -1,0 +1,108 @@
+{
+  "schema": 1,
+  "user": "ada",
+  "host": "archbox",
+  "palette": {
+    "accent": "#c33e58",
+    "secondary": "#f2d7c5",
+    "muted": "#c9a59d",
+    "colors": [
+      "#f2d7c5",
+      "#c9a59d",
+      "#493943",
+      "#200815",
+      "#32202b",
+      "#8f5e66"
+    ]
+  },
+  "modules": {
+    "os": {
+      "name": "Arch Linux",
+      "arch": "x86_64"
+    },
+    "host": {
+      "name": "MS-7D75 1.0"
+    },
+    "kernel": {
+      "release": "6.10.10-arch1-1"
+    },
+    "uptime": {
+      "seconds": 1000000
+    },
+    "packages": {
+      "total": 10,
+      "managers": {
+        "pacman": 7,
+        "flatpak": 3
+      }
+    },
+    "shell": {
+      "name": "bash",
+      "version": "5.2.37"
+    },
+    "resolution": [
+      {
+        "width": 2560,
+        "height": 1440
+      },
+      {
+        "width": 1920,
+        "height": 1080
+      }
+    ],
+    "de": {
+      "name": "KDE"
+    },
+    "wm": {
+      "name": "KWin"
+    },
+    "terminal": {
+      "name": "kitty"
+    },
+    "cpu": {
+      "name": "AMD Ryzen 9 7950X",
+      "threads": 32,
+      "ghz": 5.881
+    },
+    "temp": {
+      "celsius": 54.125
+    },
+    "load": {
+      "load1": 2.31,
+      "load5": 1.87,
+      "load15": 1.42,
+      "threads": 32
+    },
+    "gpu": [
+      {
+        "vendor": "NVIDIA",
+        "name": "GeForce RTX 4090",
+        "source": "pci"
+      },
+      {
+        "vendor": "AMD",
+        "name": "Raphael",
+        "source": "pci"
+      }
+    ],
+    "memory": {
+      "used_bytes": 11209320448,
+      "total_bytes": 66497716224,
+      "pct": 16
+    },
+    "disk": {
+      "used_bytes": 385804886016,
+      "total_bytes": 1000204886016,
+      "pct": 40
+    },
+    "git": {
+      "branch": "main",
+      "ahead": 1,
+      "behind": 0,
+      "changed": 3
+    },
+    "locale": {
+      "name": "en_US.UTF-8"
+    }
+  }
+}

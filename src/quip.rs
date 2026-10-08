@@ -105,6 +105,9 @@ const BUILT_IN: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// The longest a quip should be, in characters, placeholders filled in.
+pub const MAX_CHARS: usize = 40;
+
 /// What to say when no other rule applies.
 const FALLBACK: &[&str] = &[
     "what.",
@@ -672,9 +675,6 @@ mod tests {
 
     use super::*;
     use crate::term::RESET;
-
-    /// The longest a built-in quip may be, placeholders filled in.
-    const MAX_QUIP_CHARS: usize = 40;
 
     fn cond(src: &str) -> Condition {
         src.parse()
@@ -1261,11 +1261,7 @@ mod tests {
                 for template in &rule.say {
                     let quip = template.fill(&extreme(hour)).unwrap();
                     let len = quip.chars().count();
-                    assert!(
-                        len <= MAX_QUIP_CHARS,
-                        "rule {}: {quip:?} is {len} long",
-                        i + 1
-                    );
+                    assert!(len <= MAX_CHARS, "rule {}: {quip:?} is {len} long", i + 1);
                     assert_eq!(quip, quip.to_lowercase(), "rule {}", i + 1);
                 }
             }

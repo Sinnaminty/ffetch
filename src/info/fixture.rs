@@ -46,6 +46,8 @@ pub struct Fixture {
     /// Every path read, in order (shared, so it can be checked after the
     /// fixture moves into a `Ctx`).
     pub reads: Arc<Mutex<Vec<PathBuf>>>,
+    /// Every program run (or tried), in order, shared like `reads`.
+    pub runs: Arc<Mutex<Vec<String>>>,
 }
 
 /// The directory of the fixture `name`.
@@ -88,6 +90,7 @@ impl Fixture {
             uid: 1000,
             hour: None,
             reads: Arc::default(),
+            runs: Arc::default(),
         }
     }
 
@@ -335,6 +338,8 @@ impl System for Fixture {
     /// canned one names it); like a missing program otherwise. Canned programs
     /// never time out.
     fn run(&self, cmd: Command, _timeout: Duration) -> Option<Output> {
+        let program = cmd.get_program().to_string_lossy().into_owned();
+        self.runs.lock().unwrap().push(program);
         let argv: Vec<_> = [cmd.get_program()]
             .into_iter()
             .chain(cmd.get_args())
@@ -393,9 +398,14 @@ impl System for Fixture {
 mod tests {
     use super::*;
     use crate::{
-        info::{Info, Report, Value, collect, default_modules, value::Field},
+        info::{Info, MODULES, Report, Value, collect, default_modules, value::Field},
         layout::{self, Layout, Options},
-        palette::Roles,
+        logo::LogoImage,
+        output::{
+            format::{self, Template},
+            json,
+        },
+        palette::{self, Roles, Theme},
         quip::{self, State},
         term::{ColorMode, Rgb},
     };
@@ -442,10 +452,10 @@ mod tests {
         info.rows().into_iter().map(|r| (r.label, r.text)).collect()
     }
 
-    /// Compares `actual` with the fixture's `expected.txt`, or rewrites that
-    /// file when `UPDATE_SNAPSHOTS=1`.
-    fn assert_snapshot(name: &str, actual: &str) {
-        let path = dir(name).join("expected.txt");
+    /// Compares `actual` with the fixture's `file` (`expected.txt` or
+    /// `expected.json`), or rewrites that file when `UPDATE_SNAPSHOTS=1`.
+    fn assert_snapshot(name: &str, file: &str, actual: &str) {
+        let path = dir(name).join(file);
         if env::var("UPDATE_SNAPSHOTS").is_ok_and(|v| v == "1") {
             fs::write(&path, actual).unwrap();
             return;
@@ -485,12 +495,178 @@ mod tests {
 
     #[test]
     fn wsl2_snapshot() {
-        assert_snapshot("wsl2", &plain_text("wsl2"));
+        assert_snapshot("wsl2", "expected.txt", &plain_text("wsl2"));
     }
 
     #[test]
     fn arch_desktop_snapshot() {
-        assert_snapshot("arch-desktop", &plain_text("arch-desktop"));
+        assert_snapshot("arch-desktop", "expected.txt", &plain_text("arch-desktop"));
+    }
+
+    /// What `--json` prints for the fixture `name`: the default modules, and
+    /// the built-in logo's palette with the default theme.
+    fn json_text(name: &str) -> String {
+        let logo = LogoImage::embedded();
+        let palette = palette::extract(&logo.pixels, logo.background);
+        json::render(&fetch(name), &palette, Theme::default().roles(&palette))
+    }
+
+    #[test]
+    fn wsl2_json_snapshot() {
+        assert_snapshot("wsl2", "expected.json", &json_text("wsl2"));
+    }
+
+    #[test]
+    fn arch_desktop_json_snapshot() {
+        assert_snapshot("arch-desktop", "expected.json", &json_text("arch-desktop"));
+    }
+
+    #[test]
+    fn json_document() {
+        for (name, absent) in [
+            ("wsl2", ["temp", "resolution", "de", "wm"]),
+            ("arch-desktop", ["windows", "battery", "toolchains", "ip"]),
+        ] {
+            let text = json_text(name);
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["schema"], 1);
+            let modules = json["modules"].as_object().unwrap();
+            for id in absent {
+                assert!(!modules.contains_key(id), "{name}: {id}");
+            }
+            assert!(!text.contains("null"), "{name}: nothing is null");
+            // In the default order, the ones with nothing to report left out.
+            let at = |id: &str| text.find(&format!("\n    \"{id}\": "));
+            let order: Vec<&str> = default_modules()
+                .into_iter()
+                .filter(|id| at(id).is_some())
+                .collect();
+            let mut by_position = order.clone();
+            by_position.sort_by_key(|id| at(id));
+            assert_eq!(order, by_position, "{name}");
+            assert_eq!(order.len(), modules.len(), "{name}");
+
+            let palette = json["palette"].as_object().unwrap();
+            let hex = |v: &serde_json::Value| {
+                let s = v.as_str().unwrap();
+                assert!(
+                    s.len() == 7
+                        && s.starts_with('#')
+                        && s[1..]
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    "{s:?}"
+                );
+            };
+            for role in ["accent", "secondary", "muted"] {
+                hex(&palette[role]);
+            }
+            let colors = palette["colors"].as_array().unwrap();
+            assert!((1..=6).contains(&colors.len()));
+            colors.iter().for_each(hex);
+            assert_eq!(palette["accent"], "#c33e58", "the logo's background");
+        }
+    }
+
+    #[test]
+    fn json_values_of_the_opt_in_modules() {
+        let ctx = ctx(Fixture::load("arch-desktop"));
+        let info = collect(&ctx, &["ip", "toolchains", "docker", "git"]);
+        let json: serde_json::Value = serde_json::from_str(&json::render(
+            &info,
+            &palette_for_tests(),
+            roles_for_tests(),
+        ))
+        .unwrap();
+        assert_eq!(
+            json["modules"],
+            serde_json::json!({
+                "ip": {"address": "192.168.1.20", "interface": "enp5s0"},
+                "toolchains": {"rust": "1.98.1", "node": "22.11.0", "python": "3.12.7"},
+                "docker": {"running": 3},
+                "git": {"branch": "main", "ahead": 1, "behind": 0, "changed": 3},
+            })
+        );
+    }
+
+    fn palette_for_tests() -> palette::Palette {
+        let logo = LogoImage::embedded();
+        palette::extract(&logo.pixels, logo.background)
+    }
+
+    fn roles_for_tests() -> Roles {
+        Theme::default().roles(&palette_for_tests())
+    }
+
+    /// The `--format` line for `template` on the fixture `fixture`.
+    fn line(fixture: Fixture, template: &str) -> String {
+        let template: Template = template.parse().unwrap();
+        template.line(&ctx(fixture))
+    }
+
+    #[test]
+    fn format_lines() {
+        assert_eq!(
+            line(Fixture::load("wsl2"), format::ONELINE),
+            "Ubuntu 24.04.5 LTS x86_64 · up 6 hours, 5 mins · mem 16% · disk 8%"
+        );
+        let arch = || Fixture::load("arch-desktop");
+        // Several lines are joined with commas.
+        assert_eq!(
+            line(arch(), "{gpu} ({gpu.count})"),
+            "NVIDIA GeForce RTX 4090, AMD Raphael (2)"
+        );
+        assert_eq!(
+            line(arch(), "{cpu.ghz}GHz, load {load.load1}, {{{git.branch}}}"),
+            "5.88GHz, load 2.31, {main}"
+        );
+        // Nothing to report: empty, as are fields the value doesn't have.
+        assert_eq!(
+            line(
+                arch(),
+                "[{battery}|{battery.pct}|{windows.build}|{os.name}]"
+            ),
+            "[|||Arch Linux]"
+        );
+        let mut detached = Fixture::load("wsl2");
+        detached.cwd = Some("/elsewhere".into());
+        assert_eq!(line(detached, "git:{git.branch}:{git.ahead}"), "git::");
+    }
+
+    #[test]
+    fn format_runs_only_the_modules_it_shows() {
+        let fixture = Fixture::load("wsl2");
+        let (reads, runs) = (Arc::clone(&fixture.reads), Arc::clone(&fixture.runs));
+        assert_eq!(line(fixture, "mem {memory.pct}%"), "mem 16%");
+        let reads = reads.lock().unwrap();
+        assert!(reads.contains(&PathBuf::from("/proc/meminfo")), "{reads:?}");
+        // Besides the context's own (boot ID, WSL detection), only memory's.
+        let others: Vec<&PathBuf> = reads
+            .iter()
+            .filter(|p| {
+                ![
+                    "/proc/meminfo",
+                    "/proc/sys/kernel/random/boot_id",
+                    "/proc/sys/kernel/osrelease",
+                ]
+                .contains(&p.to_str().unwrap())
+            })
+            .collect();
+        assert!(others.is_empty(), "{others:?}");
+        assert!(
+            runs.lock().unwrap().is_empty(),
+            "{:?}",
+            runs.lock().unwrap()
+        );
+
+        // The full default run, for comparison, starts programs.
+        let fixture = Fixture::load("wsl2");
+        let runs = Arc::clone(&fixture.runs);
+        collect(&ctx(fixture), &default_modules());
+        let runs = runs.lock().unwrap();
+        for program in ["git", "wslinfo", "cmd.exe"] {
+            assert!(runs.iter().any(|r| r == program), "{program}: {runs:?}");
+        }
     }
 
     #[test]
@@ -512,7 +688,9 @@ mod tests {
         );
         assert_eq!(field(&info, "cpu", "threads"), int(16));
         assert_eq!(field(&info, "cpu", "ghz"), Some(Field::Float(2.5)));
-        assert_eq!(field(&info, "gpu", "name"), text("NVIDIA T1200 Laptop GPU"));
+        assert_eq!(field(&info, "gpu", "name"), text("T1200 Laptop GPU"));
+        assert_eq!(field(&info, "gpu", "vendor"), text("NVIDIA"));
+        assert_eq!(field(&info, "gpu", "source"), text("nvidia-smi"));
         // MemTotal 16234672 kB; used = total + Shmem - (MemFree + Buffers + Cached + SReclaimable).
         assert_eq!(field(&info, "memory", "total_bytes"), int(16234672 * 1024));
         assert_eq!(field(&info, "memory", "used_bytes"), int(2712428 * 1024));
@@ -555,7 +733,9 @@ mod tests {
         let Some(Value::Gpu(gpus)) = info.get("gpu") else {
             panic!("no GPU");
         };
-        assert_eq!(gpus.names, ["NVIDIA GeForce RTX 4090", "AMD Raphael"]);
+        let names: Vec<String> = gpus.gpus.iter().map(|g| g.full_name()).collect();
+        assert_eq!(names, ["NVIDIA GeForce RTX 4090", "AMD Raphael"]);
+        assert_eq!(field(&info, "gpu", "source"), text("pci"));
         assert_eq!(field(&info, "temp", "celsius"), Some(Field::Float(54.125)));
         assert_eq!(field(&info, "load", "load1"), Some(Field::Float(2.31)));
         assert_eq!(field(&info, "load", "threads"), int(32));
@@ -781,7 +961,7 @@ mod tests {
         fs::write(
             &file,
             format!(
-                r#"{{"boot_id": "{}", "facts": {{"windows": "Windows 99 (build 1)", "gpu": null}}}}"#,
+                r#"{{"boot_id": "{}", "facts": {{"windows": "Windows 99 (build 1)", "gpus": null}}}}"#,
                 boot_id.trim()
             ),
         )
@@ -805,10 +985,58 @@ mod tests {
             "{saved}"
         );
         assert!(
-            saved.contains("\"gpu\": \"NVIDIA T1200 Laptop GPU\""),
+            saved.contains(r#""gpus": "nvidia-smi\nNVIDIA T1200 Laptop GPU""#),
             "{saved}"
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn gpu_facts_from_before_the_source_was_kept_are_looked_up_again() {
+        let dir = env::temp_dir().join(format!("ffetch-test-{}-old-gpu-fact", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("facts.json");
+        let boot_id =
+            fs::read_to_string(super::dir("wsl2").join("root/proc/sys/kernel/random/boot_id"))
+                .unwrap();
+        let facts = |key: &str| {
+            format!(
+                r#"{{"boot_id": "{}", "facts": {{"{key}": "Some Old GPU"}}}}"#,
+                boot_id.trim()
+            )
+        };
+        let gpu = || {
+            let ctx = Ctx::new(Box::new(Fixture::load("wsl2")), Some(file.clone()), false);
+            let info = collect(&ctx, &["gpu"]);
+            (field(&info, "gpu", "name"), field(&info, "gpu", "source"))
+        };
+
+        // The old "gpu" fact (names only) is a miss: looked up again, and saved.
+        fs::write(&file, facts("gpu")).unwrap();
+        assert_eq!(gpu(), (text("T1200 Laptop GPU"), text("nvidia-smi")));
+        let saved = fs::read_to_string(&file).unwrap();
+        assert!(saved.contains(r#""gpus": "nvidia-smi\n"#), "{saved}");
+
+        // A "gpus" fact not in the new form holds until the next boot (or
+        // --refresh), but never shows: the PCI scan answers instead.
+        fs::write(&file, facts("gpus")).unwrap();
+        assert_eq!(gpu(), (text("Basic Render Driver"), text("pci")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_registry_lists_the_fields_of_each_module() {
+        let all: Vec<&str> = MODULES.iter().map(|m| m.id).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        for name in ["wsl2", "arch-desktop"] {
+            let info = collect(&ctx(Fixture::load(name)), &all);
+            for (def, value) in &info.modules {
+                assert_eq!(def.fields, value.fields(), "{}", def.id);
+                seen.insert(def.id);
+            }
+        }
+        assert_eq!(seen.len(), MODULES.len(), "the fixtures cover every module");
     }
 
     #[test]

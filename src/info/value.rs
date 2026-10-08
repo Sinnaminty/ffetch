@@ -1,8 +1,15 @@
 //! What modules report: plain structured data, plus how each value is shown
 //! after its label and which named fields it exposes (for quips and `--format`).
-//! The types are plain structs so they can derive `Serialize` for `--json`.
+//! The types are plain structs that serialize to the structured values of
+//! `--json`: snake_case keys, sizes in bytes, and unknown parts left out
+//! rather than `null`.
 
 use std::{fmt, net::Ipv4Addr};
+
+use serde::{
+    Serialize, Serializer,
+    ser::{SerializeMap, SerializeStruct},
+};
 
 /// What every module value can do.
 pub trait Report {
@@ -75,8 +82,10 @@ impl fmt::Display for Field {
     }
 }
 
-/// The value of one module. Each variant is named after its module.
-#[derive(Clone, Debug, PartialEq)]
+/// The value of one module. Each variant is named after its module, and
+/// serializes as the value it holds.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
 pub enum Value {
     Os(Os),
     Host(Name),
@@ -138,6 +147,34 @@ impl Value {
             v => vec![v.report()],
         }
     }
+
+    /// The names `field` answers to for this kind of value; the registry
+    /// lists the same for each module.
+    #[cfg(test)]
+    pub fn fields(&self) -> &'static [&'static str] {
+        match self {
+            Value::Os(_) => Os::FIELDS,
+            Value::Host(_) | Value::De(_) | Value::Wm(_) | Value::Terminal(_) => Name::FIELDS,
+            Value::Locale(_) => Name::FIELDS,
+            Value::Windows(_) => Windows::FIELDS,
+            Value::Kernel(_) => Kernel::FIELDS,
+            Value::Uptime(_) => Uptime::FIELDS,
+            Value::Packages(_) => Packages::FIELDS,
+            Value::Shell(_) => Shell::FIELDS,
+            Value::Resolution(_) => Resolution::FIELDS,
+            Value::Cpu(_) => Cpu::FIELDS,
+            Value::Temp(_) => Temp::FIELDS,
+            Value::Load(_) => Load::FIELDS,
+            Value::Gpu(_) => Gpus::FIELDS,
+            Value::Memory(_) | Value::Disk(_) => Usage::FIELDS,
+            Value::Battery(_) => Batteries::FIELDS,
+            Value::Git(_) => Git::FIELDS,
+            Value::Toolchains(_) => Toolchains::FIELDS,
+            Value::Docker(_) => Containers::FIELDS,
+            Value::Ip(_) => LocalIp::FIELDS,
+            Value::Updates(_) => Updates::FIELDS,
+        }
+    }
 }
 
 impl Report for Value {
@@ -162,13 +199,20 @@ fn int(n: impl TryInto<u64>) -> Option<Field> {
     n.try_into().ok().map(Field::Int)
 }
 
+/// For `skip_serializing_if`: a count of 0 means unknown.
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 /// A value that is just a name: host model, DE, WM, terminal, locale.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Name {
     pub name: String,
 }
 
 impl Name {
+    pub const FIELDS: &[&str] = &["name"];
+
     pub fn new(name: impl Into<String>) -> Name {
         Name { name: name.into() }
     }
@@ -187,12 +231,16 @@ impl Report for Name {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Os {
     /// e.g. "Ubuntu 24.04.5 LTS".
     pub name: String,
     /// e.g. "x86_64".
     pub arch: String,
+}
+
+impl Os {
+    pub const FIELDS: &[&str] = &["name", "arch"];
 }
 
 impl Report for Os {
@@ -210,14 +258,17 @@ impl Report for Os {
 }
 
 /// The Windows version under WSL.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Windows {
     /// "Windows 11" or "Windows 10".
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub build: Option<u32>,
 }
 
 impl Windows {
+    pub const FIELDS: &[&str] = &["name", "build"];
+
     /// Parses what `display` shows, "Windows 11 (build 26300)", which is also
     /// the form the fact cache keeps. Anything else is all name.
     pub fn parse(s: &str) -> Windows {
@@ -257,9 +308,13 @@ impl Report for Windows {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Kernel {
     pub release: String,
+}
+
+impl Kernel {
+    pub const FIELDS: &[&str] = &["release"];
 }
 
 impl Report for Kernel {
@@ -275,9 +330,13 @@ impl Report for Kernel {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Uptime {
     pub seconds: u64,
+}
+
+impl Uptime {
+    pub const FIELDS: &[&str] = &["seconds", "days"];
 }
 
 impl Report for Uptime {
@@ -327,8 +386,34 @@ pub struct ManagerCount {
 }
 
 impl Packages {
+    /// `total`, then each package manager `packages` knows.
+    pub const FIELDS: &[&str] = &[
+        "total", "dpkg", "pacman", "rpm", "apk", "emerge", "brew", "flatpak", "snap",
+    ];
+
     pub fn total(&self) -> usize {
         self.managers.iter().map(|m| m.count).sum()
+    }
+}
+
+/// `{"total": 1146, "managers": {"dpkg": 1140, "snap": 6}}`, managers in
+/// display order.
+impl Serialize for Packages {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        struct Managers<'a>(&'a [ManagerCount]);
+        impl Serialize for Managers<'_> {
+            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                let mut map = s.serialize_map(Some(self.0.len()))?;
+                for m in self.0 {
+                    map.serialize_entry(m.manager, &m.count)?;
+                }
+                map.end()
+            }
+        }
+        let mut st = s.serialize_struct("Packages", 2)?;
+        st.serialize_field("total", &self.total())?;
+        st.serialize_field("managers", &Managers(&self.managers))?;
+        st.end()
     }
 }
 
@@ -352,11 +437,16 @@ impl Report for Packages {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Shell {
     /// The binary's name, e.g. "zsh".
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+}
+
+impl Shell {
+    pub const FIELDS: &[&str] = &["name", "version"];
 }
 
 impl Report for Shell {
@@ -383,6 +473,37 @@ pub struct Resolution {
     pub modes: Vec<String>,
 }
 
+impl Resolution {
+    pub const FIELDS: &[&str] = &["count"];
+}
+
+/// The width and height in a mode's name: "1920x1080", or "1920x1080i" for
+/// an interlaced mode.
+fn mode_size(mode: &str) -> Option<(u32, u32)> {
+    let (width, rest) = mode.split_once('x')?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    Some((width.parse().ok()?, rest[..digits].parse().ok()?))
+}
+
+/// `[{"width": 2560, "height": 1440}, …]`, one per display. A mode named
+/// some other way (the kernel doesn't) is left out.
+impl Serialize for Resolution {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Size {
+            width: u32,
+            height: u32,
+        }
+        let sizes: Vec<Size> = self
+            .modes
+            .iter()
+            .filter_map(|m| mode_size(m))
+            .map(|(width, height)| Size { width, height })
+            .collect();
+        sizes.serialize(s)
+    }
+}
+
 impl Report for Resolution {
     fn display(&self) -> String {
         self.modes.join(", ")
@@ -396,14 +517,20 @@ impl Report for Resolution {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Cpu {
     /// The model without the marketing noise, e.g. "AMD Ryzen 9 7950X".
     pub name: String,
     /// Logical CPUs; 0 if unknown.
+    #[serde(skip_serializing_if = "is_zero")]
     pub threads: usize,
     /// The maximum (or else nominal or current) clock.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ghz: Option<f64>,
+}
+
+impl Cpu {
+    pub const FIELDS: &[&str] = &["name", "threads", "ghz"];
 }
 
 impl Report for Cpu {
@@ -428,29 +555,90 @@ impl Report for Cpu {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// The GPUs, in the order found. Serialized as a list.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct Gpus {
-    /// Full names, e.g. "NVIDIA GeForce RTX 4090", one per GPU.
-    pub names: Vec<String>,
+    pub gpus: Vec<Gpu>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Gpu {
+    /// "NVIDIA", "AMD", …, when the source says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    /// The model, without the vendor when that is known: "GeForce RTX 4090".
+    pub name: String,
+    pub source: GpuSource,
+}
+
+/// Where a GPU's name came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GpuSource {
+    /// The PCI bus, with names from pci.ids.
+    Pci,
+    /// The NVIDIA driver, on WSL.
+    NvidiaSmi,
+    /// Windows' list of video controllers, on WSL.
+    Powershell,
+}
+
+impl GpuSource {
+    const ALL: [GpuSource; 3] = [GpuSource::Pci, GpuSource::NvidiaSmi, GpuSource::Powershell];
+
+    /// "pci", "nvidia-smi" or "powershell", as in the JSON output.
+    pub fn name(self) -> &'static str {
+        match self {
+            GpuSource::Pci => "pci",
+            GpuSource::NvidiaSmi => "nvidia-smi",
+            GpuSource::Powershell => "powershell",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<GpuSource> {
+        GpuSource::ALL.into_iter().find(|s| s.name() == name)
+    }
+}
+
+impl Gpus {
+    pub const FIELDS: &[&str] = &["name", "vendor", "source", "count"];
+}
+
+impl Gpu {
+    /// "NVIDIA GeForce RTX 4090": the vendor, if known, and the model.
+    pub fn full_name(&self) -> String {
+        match &self.vendor {
+            Some(vendor) => format!("{vendor} {}", self.name),
+            None => self.name.clone(),
+        }
+    }
 }
 
 impl Report for Gpus {
+    /// A line per GPU.
     fn display(&self) -> String {
-        self.names.join("\n")
+        let names: Vec<String> = self.gpus.iter().map(Gpu::full_name).collect();
+        names.join("\n")
     }
 
-    /// `name` is the first GPU's.
+    /// `count`, or the first GPU's `name`, `vendor` or `source`.
     fn field(&self, name: &str) -> Option<Field> {
+        if name == "count" {
+            return int(self.gpus.len());
+        }
+        let gpu = self.gpus.first()?;
         match name {
-            "name" => text(self.names.first()?),
-            "count" => int(self.names.len()),
+            "name" => text(&gpu.name),
+            "vendor" => text(gpu.vendor.as_deref()?),
+            "source" => text(gpu.source.name()),
             _ => None,
         }
     }
 }
 
 /// Used and total space, for memory and disk.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Usage {
     pub used_bytes: u64,
     pub total_bytes: u64,
@@ -460,6 +648,8 @@ pub struct Usage {
 }
 
 impl Usage {
+    pub const FIELDS: &[&str] = &["used_bytes", "total_bytes", "pct"];
+
     /// `used` of `total`, where `capacity` is what the percentage is out of.
     pub fn new(used_bytes: u64, total_bytes: u64, capacity: u64) -> Usage {
         Usage {
@@ -504,17 +694,24 @@ fn human_size(bytes: u64) -> String {
     format!("{value:.2} {}", UNITS[unit])
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// Serialized as a list, one per battery.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct Batteries {
     pub batteries: Vec<Battery>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Battery {
     /// Charge in percent.
     pub pct: u64,
     /// As the kernel says it: "Charging", "Discharging", "Full", …
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+}
+
+impl Batteries {
+    pub const FIELDS: &[&str] = &["count", "pct", "status"];
 }
 
 impl Report for Batteries {
@@ -555,9 +752,13 @@ impl Report for Battery {
 }
 
 /// The CPU temperature.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Temp {
     pub celsius: f64,
+}
+
+impl Temp {
+    pub const FIELDS: &[&str] = &["celsius"];
 }
 
 impl Report for Temp {
@@ -575,13 +776,18 @@ impl Report for Temp {
 }
 
 /// The load average: runnable and waiting tasks over 1, 5 and 15 minutes.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Load {
     pub load1: f64,
     pub load5: f64,
     pub load15: f64,
     /// Logical CPUs, for scale; 0 if unknown.
+    #[serde(skip_serializing_if = "is_zero")]
     pub threads: usize,
+}
+
+impl Load {
+    pub const FIELDS: &[&str] = &["load1", "load5", "load15", "threads"];
 }
 
 impl Report for Load {
@@ -615,6 +821,31 @@ pub struct Git {
     pub ahead_behind: Option<(u64, u64)>,
     /// Files with changes, staged or not, including untracked ones.
     pub changed: u64,
+}
+
+impl Git {
+    pub const FIELDS: &[&str] = &["branch", "ahead", "behind", "changed"];
+}
+
+/// `{"branch": "main", "ahead": 1, "behind": 0, "changed": 3}`, without
+/// `ahead` and `behind` when there is no upstream.
+impl Serialize for Git {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("Git", 4)?;
+        st.serialize_field("branch", &self.branch)?;
+        match self.ahead_behind {
+            Some((ahead, behind)) => {
+                st.serialize_field("ahead", &ahead)?;
+                st.serialize_field("behind", &behind)?;
+            }
+            None => {
+                st.skip_field("ahead")?;
+                st.skip_field("behind")?;
+            }
+        }
+        st.serialize_field("changed", &self.changed)?;
+        st.end()
+    }
 }
 
 impl Report for Git {
@@ -658,6 +889,22 @@ pub struct Tool {
     pub version: String,
 }
 
+impl Toolchains {
+    /// `count`, then each toolchain `toolchains` asks for.
+    pub const FIELDS: &[&str] = &["count", "rust", "node", "python"];
+}
+
+/// `{"rust": "1.98.1", "node": "22.11.0"}`, the installed ones only.
+impl Serialize for Toolchains {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut map = s.serialize_map(Some(self.tools.len()))?;
+        for tool in &self.tools {
+            map.serialize_entry(tool.name, &tool.version)?;
+        }
+        map.end()
+    }
+}
+
 impl Report for Toolchains {
     /// "rust 1.98.1 · node 22.11.0 · python 3.12.3"
     fn display(&self) -> String {
@@ -679,9 +926,13 @@ impl Report for Toolchains {
 }
 
 /// Docker's running containers.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Containers {
     pub running: usize,
+}
+
+impl Containers {
+    pub const FIELDS: &[&str] = &["running"];
 }
 
 impl Report for Containers {
@@ -699,11 +950,22 @@ impl Report for Containers {
 }
 
 /// The machine's address on the local network.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LocalIp {
+    /// Serialized as text, "192.168.1.20".
+    #[serde(serialize_with = "as_text")]
     pub address: Ipv4Addr,
     /// e.g. "eth0".
     pub interface: String,
+}
+
+impl LocalIp {
+    pub const FIELDS: &[&str] = &["address", "interface"];
+}
+
+/// Serializes `value` as the text it displays as.
+fn as_text<S: Serializer>(value: &impl fmt::Display, s: S) -> Result<S::Ok, S::Error> {
+    s.collect_str(value)
 }
 
 impl Report for LocalIp {
@@ -722,11 +984,15 @@ impl Report for LocalIp {
 }
 
 /// Pending package updates.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Updates {
     pub total: u64,
     /// How many of them are security updates.
     pub security: u64,
+}
+
+impl Updates {
+    pub const FIELDS: &[&str] = &["total", "security"];
 }
 
 impl Report for Updates {
@@ -918,6 +1184,17 @@ mod tests {
     }
 
     #[test]
+    fn git_fields() {
+        let git = |ahead_behind| Git {
+            branch: "main".into(),
+            ahead_behind,
+            changed: 0,
+        };
+        assert_eq!(git(Some((1, 2))).field("ahead"), int(1u64));
+        assert_eq!(git(Some((1, 2))).field("behind"), int(2u64));
+    }
+
+    #[test]
     fn small_module_formatting() {
         let tools = Toolchains {
             tools: vec![
@@ -948,5 +1225,287 @@ mod tests {
         };
         assert_eq!(ip.display(), "192.168.1.20 (eth0)");
         assert_eq!(ip.field("address"), text("192.168.1.20"));
+    }
+
+    fn gpu(vendor: Option<&str>, name: &str, source: GpuSource) -> Gpu {
+        Gpu {
+            vendor: vendor.map(str::to_string),
+            name: name.into(),
+            source,
+        }
+    }
+
+    #[test]
+    fn gpus_show_the_vendor_before_the_name() {
+        let gpus = Gpus {
+            gpus: vec![
+                gpu(Some("NVIDIA"), "T1200 Laptop GPU", GpuSource::NvidiaSmi),
+                gpu(None, "Intel(R) UHD Graphics", GpuSource::Powershell),
+            ],
+        };
+        assert_eq!(
+            gpus.display(),
+            "NVIDIA T1200 Laptop GPU\nIntel(R) UHD Graphics"
+        );
+        assert_eq!(gpus.field("name"), text("T1200 Laptop GPU"));
+        assert_eq!(gpus.field("vendor"), text("NVIDIA"));
+        assert_eq!(gpus.field("source"), text("nvidia-smi"));
+        assert_eq!(gpus.field("count"), int(2usize));
+        for (source, name) in [
+            (GpuSource::Pci, "pci"),
+            (GpuSource::NvidiaSmi, "nvidia-smi"),
+            (GpuSource::Powershell, "powershell"),
+        ] {
+            assert_eq!(source.name(), name);
+            assert_eq!(GpuSource::from_name(name), Some(source));
+            assert_eq!(json(&source), serde_json::json!(name));
+        }
+        assert_eq!(GpuSource::from_name("PCI"), None);
+    }
+
+    fn json(value: &impl Serialize) -> serde_json::Value {
+        serde_json::to_value(value).unwrap()
+    }
+
+    /// One value of every kind, with every optional part filled in, and the
+    /// JSON it gives.
+    fn every_kind() -> Vec<(Value, serde_json::Value)> {
+        use serde_json::json;
+        let name = |s: &str| Name::new(s);
+        let all_managers = Packages::FIELDS[1..]
+            .iter()
+            .enumerate()
+            .map(|(i, &manager)| ManagerCount {
+                manager,
+                count: i + 1,
+            })
+            .collect();
+        vec![
+            (
+                Value::Os(Os {
+                    name: "Ubuntu 24.04.5 LTS".into(),
+                    arch: "x86_64".into(),
+                }),
+                json!({"name": "Ubuntu 24.04.5 LTS", "arch": "x86_64"}),
+            ),
+            (Value::Host(name("MS-7D75")), json!({"name": "MS-7D75"})),
+            (
+                Value::Windows(Windows::parse("Windows 11 (build 26300)")),
+                json!({"name": "Windows 11", "build": 26300}),
+            ),
+            (
+                Value::Kernel(Kernel {
+                    release: "6.6.87".into(),
+                }),
+                json!({"release": "6.6.87"}),
+            ),
+            (
+                Value::Uptime(Uptime { seconds: 11580 }),
+                json!({"seconds": 11580}),
+            ),
+            (
+                Value::Packages(Packages {
+                    managers: all_managers,
+                }),
+                json!({"total": 36, "managers": {"dpkg": 1, "pacman": 2, "rpm": 3, "apk": 4,
+                    "emerge": 5, "brew": 6, "flatpak": 7, "snap": 8}}),
+            ),
+            (
+                Value::Shell(Shell {
+                    name: "zsh".into(),
+                    version: Some("5.9".into()),
+                }),
+                json!({"name": "zsh", "version": "5.9"}),
+            ),
+            (
+                Value::Resolution(Resolution {
+                    modes: vec!["2560x1440".into(), "1920x1080i".into()],
+                }),
+                json!([{"width": 2560, "height": 1440}, {"width": 1920, "height": 1080}]),
+            ),
+            (Value::De(name("KDE")), json!({"name": "KDE"})),
+            (Value::Wm(name("KWin")), json!({"name": "KWin"})),
+            (Value::Terminal(name("kitty")), json!({"name": "kitty"})),
+            (
+                Value::Cpu(Cpu {
+                    name: "AMD Ryzen 9 7950X".into(),
+                    threads: 32,
+                    ghz: Some(5.881),
+                }),
+                json!({"name": "AMD Ryzen 9 7950X", "threads": 32, "ghz": 5.881}),
+            ),
+            (
+                Value::Temp(Temp { celsius: 54.125 }),
+                json!({"celsius": 54.125}),
+            ),
+            (
+                Value::Load(Load {
+                    load1: 0.14,
+                    load5: 0.15,
+                    load15: 0.08,
+                    threads: 16,
+                }),
+                json!({"load1": 0.14, "load5": 0.15, "load15": 0.08, "threads": 16}),
+            ),
+            (
+                Value::Gpu(Gpus {
+                    gpus: vec![gpu(
+                        Some("NVIDIA"),
+                        "T1200 Laptop GPU",
+                        GpuSource::NvidiaSmi,
+                    )],
+                }),
+                json!([{"vendor": "NVIDIA", "name": "T1200 Laptop GPU", "source": "nvidia-smi"}]),
+            ),
+            (
+                Value::Memory(Usage::new(1024, 4096, 4096)),
+                json!({"used_bytes": 1024, "total_bytes": 4096, "pct": 25}),
+            ),
+            (
+                Value::Disk(Usage::new(10, 100, 50)),
+                json!({"used_bytes": 10, "total_bytes": 100, "pct": 20}),
+            ),
+            (
+                Value::Battery(Batteries {
+                    batteries: vec![Battery {
+                        pct: 80,
+                        status: Some("Charging".into()),
+                    }],
+                }),
+                json!([{"pct": 80, "status": "Charging"}]),
+            ),
+            (
+                Value::Git(Git {
+                    branch: "main".into(),
+                    ahead_behind: Some((1, 0)),
+                    changed: 3,
+                }),
+                json!({"branch": "main", "ahead": 1, "behind": 0, "changed": 3}),
+            ),
+            (Value::Locale(name("C.UTF-8")), json!({"name": "C.UTF-8"})),
+            (
+                Value::Toolchains(Toolchains {
+                    tools: vec![
+                        Tool {
+                            name: "rust",
+                            version: "1.98.1".into(),
+                        },
+                        Tool {
+                            name: "node",
+                            version: "22.11.0".into(),
+                        },
+                        Tool {
+                            name: "python",
+                            version: "3.12.3".into(),
+                        },
+                    ],
+                }),
+                json!({"rust": "1.98.1", "node": "22.11.0", "python": "3.12.3"}),
+            ),
+            (
+                Value::Docker(Containers { running: 3 }),
+                json!({"running": 3}),
+            ),
+            (
+                Value::Ip(LocalIp {
+                    address: Ipv4Addr::new(192, 168, 1, 20),
+                    interface: "eth0".into(),
+                }),
+                json!({"address": "192.168.1.20", "interface": "eth0"}),
+            ),
+            (
+                Value::Updates(Updates {
+                    total: 15,
+                    security: 5,
+                }),
+                json!({"total": 15, "security": 5}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn json_shapes() {
+        let values = every_kind();
+        assert_eq!(values.len(), 24, "one per kind of value");
+        for (value, expected) in values {
+            assert_eq!(json(&value), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn json_leaves_out_what_is_unknown() {
+        use serde_json::json;
+        let cases = [
+            (
+                Value::Windows(Windows::parse("Windows 11")),
+                json!({"name": "Windows 11"}),
+            ),
+            (
+                Value::Shell(Shell {
+                    name: "dash".into(),
+                    version: None,
+                }),
+                json!({"name": "dash"}),
+            ),
+            (
+                Value::Cpu(Cpu {
+                    name: "Some CPU".into(),
+                    threads: 0,
+                    ghz: None,
+                }),
+                json!({"name": "Some CPU"}),
+            ),
+            (
+                Value::Load(Load {
+                    load1: 1.0,
+                    load5: 2.0,
+                    load15: 3.0,
+                    threads: 0,
+                }),
+                json!({"load1": 1.0, "load5": 2.0, "load15": 3.0}),
+            ),
+            (
+                Value::Gpu(Gpus {
+                    gpus: vec![gpu(None, "abcd Device 0001", GpuSource::Pci)],
+                }),
+                json!([{"name": "abcd Device 0001", "source": "pci"}]),
+            ),
+            (
+                Value::Battery(Batteries {
+                    batteries: vec![Battery {
+                        pct: 9,
+                        status: None,
+                    }],
+                }),
+                json!([{"pct": 9}]),
+            ),
+            (
+                Value::Git(Git {
+                    branch: "dev".into(),
+                    ahead_behind: None,
+                    changed: 0,
+                }),
+                json!({"branch": "dev", "changed": 0}),
+            ),
+            (
+                Value::Resolution(Resolution {
+                    modes: vec!["preferred".into(), "800x600".into()],
+                }),
+                json!([{"width": 800, "height": 600}]),
+            ),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(json(&value), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn every_listed_field_is_answered() {
+        for (value, _) in every_kind() {
+            for name in value.fields() {
+                assert!(value.field(name).is_some(), "{value:?} has no {name}");
+            }
+            assert_eq!(value.field("nope"), None, "{value:?}");
+        }
     }
 }

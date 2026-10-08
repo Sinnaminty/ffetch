@@ -3,7 +3,7 @@
 
 use std::{path::Path, process::Command};
 
-use crate::info::{Ctx, System};
+use crate::info::{Ctx, Gpu, GpuSource, System};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wsl {
@@ -93,8 +93,16 @@ fn windows_version(ver: &str) -> Option<String> {
     Some(format!("{name} (build {build})"))
 }
 
-/// The physical GPUs, one per line. WSL's own PCI bus only has a virtual
-/// adapter, so ask the NVIDIA driver (~120 ms), or else Windows (~700 ms).
+/// The per-boot fact with the physical GPUs, as `gpus` finds them: where the
+/// names came from on the first line ("nvidia-smi" or "powershell"), then a
+/// name per line. Before the JSON output needed the source, the fact was
+/// "gpu" with only the names; such an entry is ignored, so the first run after
+/// an upgrade looks the GPUs up again.
+pub const GPU_FACT: &str = "gpus";
+
+/// The physical GPUs, in the form of `GPU_FACT`. WSL's own PCI bus only has a
+/// virtual adapter, so ask the NVIDIA driver (~120 ms), or else Windows
+/// (~700 ms).
 pub fn gpus(ctx: &Ctx) -> Option<String> {
     let mut nvidia_smi = Command::new(NVIDIA_SMI);
     nvidia_smi.args(["--query-gpu=name", "--format=csv,noheader"]);
@@ -105,10 +113,40 @@ pub fn gpus(ctx: &Ctx) -> Option<String> {
         "-Command",
         "(Get-CimInstance Win32_VideoController).Name",
     ]);
-    [nvidia_smi, powershell].into_iter().find_map(|cmd| {
+    [
+        (GpuSource::NvidiaSmi, nvidia_smi),
+        (GpuSource::Powershell, powershell),
+    ]
+    .into_iter()
+    .find_map(|(source, cmd)| {
         let out = ctx.run(cmd).filter(|o| o.status.success())?;
-        gpu_names(&String::from_utf8_lossy(&out.stdout))
+        let names = gpu_names(&String::from_utf8_lossy(&out.stdout))?;
+        Some(format!("{}\n{names}", source.name()))
     })
+}
+
+/// The GPUs in a `GPU_FACT` value; `None` if it isn't in that form. Only
+/// `nvidia-smi` says who makes the GPU; PowerShell's names are kept whole.
+pub fn parse_gpus(fact: &str) -> Option<Vec<Gpu>> {
+    let mut lines = fact.lines();
+    let source = GpuSource::from_name(lines.next()?)?;
+    let gpus: Vec<Gpu> = lines
+        .filter(|name| !name.is_empty())
+        .map(|name| match source {
+            // "NVIDIA T1200 Laptop GPU"; older models are named without "NVIDIA".
+            GpuSource::NvidiaSmi => Gpu {
+                vendor: Some("NVIDIA".into()),
+                name: name.strip_prefix("NVIDIA ").unwrap_or(name).into(),
+                source,
+            },
+            _ => Gpu {
+                vendor: None,
+                name: name.into(),
+                source,
+            },
+        })
+        .collect();
+    (!gpus.is_empty()).then_some(gpus)
 }
 
 /// One name per output line; Windows programs end them with CRLF.
@@ -234,6 +272,41 @@ mod tests {
         );
         for empty in ["", "\n", " \r\n\r\n"] {
             assert_eq!(gpu_names(empty), None, "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn gpu_facts() {
+        let gpu = |vendor: Option<&str>, name: &str, source| Gpu {
+            vendor: vendor.map(str::to_string),
+            name: name.into(),
+            source,
+        };
+        assert_eq!(
+            parse_gpus("nvidia-smi\nNVIDIA T1200 Laptop GPU\nQuadro P1000"),
+            Some(vec![
+                gpu(Some("NVIDIA"), "T1200 Laptop GPU", GpuSource::NvidiaSmi),
+                gpu(Some("NVIDIA"), "Quadro P1000", GpuSource::NvidiaSmi),
+            ])
+        );
+        assert_eq!(
+            parse_gpus("powershell\nIntel(R) UHD Graphics"),
+            Some(vec![gpu(
+                None,
+                "Intel(R) UHD Graphics",
+                GpuSource::Powershell
+            )])
+        );
+        // The names-only form of the old "gpu" fact, and other junk.
+        for junk in [
+            "",
+            "nvidia-smi",
+            "nvidia-smi\n",
+            "NVIDIA T1200 Laptop GPU",
+            "NVIDIA T1200 Laptop GPU\nIntel(R) UHD Graphics",
+            "Nvidia-SMI\nNVIDIA T1200 Laptop GPU",
+        ] {
+            assert_eq!(parse_gpus(junk), None, "{junk:?}");
         }
     }
 }

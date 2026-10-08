@@ -3,7 +3,8 @@
 Each directory here is a fake machine. The fixture tests in
 `src/info/fixture.rs` run the info modules against it in place of the real
 system (through `info::System`). Then they compare the plain `--no-color` info
-column with `expected.txt`, quip included (picked with a fixed seed).
+column with `expected.txt`, quip included (picked with a fixed seed), and the
+`--json` output with `expected.json` (with the built-in logo's palette).
 
 ```
 <name>/
@@ -16,7 +17,8 @@ column with `expected.txt`, quip included (picked with a fixed seed).
   interfaces     getifaddrs, one address per line: eth0 192.168.1.20 up,running
   commands/      canned program runs, one file each (any name)
   sockets/       canned Unix socket exchanges, one file each (any name)
-  expected.txt   the snapshot
+  expected.txt   the text snapshot
+  expected.json  the JSON snapshot
 ```
 
 In `env`, `uname`, `process`, `clock`, `statvfs` and `interfaces`, blank
@@ -84,8 +86,8 @@ Content-Type: application/json
 
 ## Snapshots
 
-`cargo test` fails when the output differs from `expected.txt` and prints a
-diff. After an intended change, run `UPDATE_SNAPSHOTS=1 cargo test` and review
+`cargo test` fails when the output differs from `expected.txt` or
+`expected.json` and prints a diff. After an intended change, run `UPDATE_SNAPSHOTS=1 cargo test` and review
 the rewritten files with `git diff`.
 
 ## The fixtures

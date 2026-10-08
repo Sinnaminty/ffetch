@@ -11,7 +11,7 @@ use crate::{
 
 /// Spaces between the logo and the info column.
 const GAP: usize = 3;
-const DEFAULT_LOGO_COLS: usize = 48;
+pub const DEFAULT_LOGO_COLS: usize = 48;
 pub const MIN_LOGO_COLS: usize = 16;
 /// The info column is truncated down to this before the logo is dropped entirely.
 const MIN_INFO_COLS: usize = 32;
@@ -40,7 +40,7 @@ pub enum Placement {
 }
 
 /// What the swatch rows at the bottom of the info column show.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Swatches {
     /// One row with the palette taken from the logo.
     Palette,

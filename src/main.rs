@@ -1,9 +1,11 @@
 mod cache;
 mod command;
+mod config;
 mod image;
 mod info;
 mod layout;
 mod logo;
+mod output;
 mod palette;
 mod quip;
 mod rng;
@@ -17,9 +19,10 @@ use std::{
     process::exit,
 };
 
-use layout::{Layout, MIN_LOGO_COLS, Options, Swatches};
-use logo::{LogoImage, Style};
-use palette::Theme;
+use config::{Config, Flags};
+use layout::{MIN_LOGO_COLS, Options};
+use logo::LogoImage;
+use output::format::{self, Template};
 use term::ColorMode;
 
 const HELP: &str = "\
@@ -40,40 +43,52 @@ Options:
       --no-quip          Hide the character's remark under the info
       --no-color         Disable colors (NO_COLOR is honored too)
       --refresh          Recompute the facts cached until the next boot
+      --json             Print the info and the palette as JSON
+      --format <text>    Print one line of text: {module} is a module's value,
+                         {module.field} one of its fields (e.g. {memory.pct}),
+                         and {{ and }} are braces
+      --oneline          OS, uptime, memory and disk on one line (a --format preset)
+      --config <path>    Read this config file instead of
+                         ${XDG_CONFIG_HOME:-~/.config}/ffetch/config.toml
+      --print-config     Print the settings in effect as a config file
   -h, --help             Show this help
   -V, --version          Show the version
+
+Options override the config file.
 ";
 
+/// What to print.
+enum Output {
+    /// The logo beside (or above) the info.
+    Text,
+    Json,
+    /// One line from a template: `--format` or `--oneline`.
+    Line(Template),
+}
+
 struct Args {
-    logo: Option<Style>,
-    size: Option<usize>,
-    no_color: bool,
-    image: Option<PathBuf>,
-    keep_background: bool,
-    layout: Layout,
-    /// `--modules`: the module list, replacing the default one.
+    /// What the options say about the settings in the config file.
+    flags: Flags,
+    /// `--modules`, as given.
     modules: Option<String>,
-    swatches: Swatches,
-    bars: bool,
-    /// Show a quip under the info.
-    quip: bool,
+    no_color: bool,
     /// Recompute the facts cached per boot.
     refresh: bool,
+    /// `--config`.
+    config: Option<PathBuf>,
+    print_config: bool,
+    output: Output,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
-        logo: Some(Style::Ascii),
-        size: None,
-        no_color: false,
-        image: None,
-        keep_background: false,
-        layout: Layout::Auto,
+        flags: Flags::default(),
         modules: None,
-        swatches: Swatches::Palette,
-        bars: true,
-        quip: true,
+        no_color: false,
         refresh: false,
+        config: None,
+        print_config: false,
+        output: Output::Text,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -83,6 +98,14 @@ fn parse_args() -> Result<Args, String> {
             _ => (arg, None),
         };
         let mut value = || inline.clone().or_else(|| argv.next());
+        let mut output = |output: Output| {
+            if !matches!(args.output, Output::Text) {
+                return Err("--json, --format and --oneline don't go together");
+            }
+            args.output = output;
+            Ok(())
+        };
+        let flags = &mut args.flags;
         match flag.as_str() {
             "-h" | "--help" => {
                 print!("{HELP}{}", module_help());
@@ -93,49 +116,49 @@ fn parse_args() -> Result<Args, String> {
                 exit(0);
             }
             "--no-color" => args.no_color = true,
-            "--no-bars" => args.bars = false,
-            "--no-quip" => args.quip = false,
-            "-l" | "--logo" => {
-                args.logo = match value().as_deref() {
-                    Some("ascii") => Some(Style::Ascii),
-                    Some("blocks") => Some(Style::Blocks),
-                    Some("none") => None,
-                    v => return Err(expected("--logo", "ascii, blocks or none", v)),
-                }
-            }
-            "--image" => args.image = Some(value().ok_or("--image expects a path")?.into()),
-            "--keep-background" => args.keep_background = true,
+            "--no-bars" => flags.bars = Some(false),
+            "--no-quip" => flags.quip = Some(false),
+            "-l" | "--logo" => flags.style = Some(choose("--logo", config::STYLES, value())?),
+            "--image" => flags.image = Some(value().ok_or("--image expects a path")?.into()),
+            "--keep-background" => flags.keep_background = Some(true),
             "--refresh" => args.refresh = true,
-            "--layout" => {
-                args.layout = match value().as_deref() {
-                    Some("auto") => Layout::Auto,
-                    Some("side") => Layout::Side,
-                    Some("stacked") => Layout::Stacked,
-                    v => return Err(expected("--layout", "auto, side or stacked", v)),
-                }
-            }
+            "--layout" => flags.layout = Some(choose("--layout", config::LAYOUTS, value())?),
             "--modules" => {
                 args.modules = Some(value().ok_or("--modules expects a list of module ids")?)
             }
-            "--swatches" => {
-                args.swatches = match value().as_deref() {
-                    Some("palette") => Swatches::Palette,
-                    Some("ansi") => Swatches::Ansi,
-                    Some("none") => Swatches::None,
-                    v => return Err(expected("--swatches", "palette, ansi or none", v)),
-                }
-            }
+            "--swatches" => flags.swatches = Some(choose("--swatches", config::SWATCHES, value())?),
             "-s" | "--size" => {
                 let cols = value()
                     .and_then(|v| v.parse().ok())
                     .filter(|&n| n >= MIN_LOGO_COLS);
-                args.size =
+                flags.size =
                     Some(cols.ok_or(format!("--size expects a number >= {MIN_LOGO_COLS}"))?);
             }
+            "--json" => output(Output::Json)?,
+            "--format" => {
+                let template = value().ok_or("--format expects a template")?;
+                let template = template.parse().map_err(|e| format!("--format: {e}"))?;
+                output(Output::Line(template))?
+            }
+            "--oneline" => output(Output::Line(
+                format::ONELINE.parse().expect("the preset parses"),
+            ))?,
+            "--config" => args.config = Some(value().ok_or("--config expects a path")?.into()),
+            "--print-config" => args.print_config = true,
             other => return Err(format!("unknown option '{other}'")),
         }
     }
     Ok(args)
+}
+
+/// The value of the word `got` in `table`, for the option `flag`.
+fn choose<T: Copy>(flag: &str, table: &[(&str, T)], got: Option<String>) -> Result<T, String> {
+    got.as_deref()
+        .and_then(|word| config::lookup(table, word))
+        .ok_or_else(|| {
+            let got = got.map_or("nothing".into(), |v| format!("'{v}'"));
+            format!("{flag} expects {}, got {got}", config::choices(table, ""))
+        })
 }
 
 /// The module ids for `--help`: the default ones in display order, then the
@@ -177,46 +200,76 @@ fn wrap(words: &[&str]) -> String {
     lines.iter().map(|l| format!("  {l}\n")).collect()
 }
 
-/// Error for an option that takes one of a few words.
-fn expected(flag: &str, choices: &str, got: Option<&str>) -> String {
-    let got = got.map_or("nothing".into(), |v| format!("'{v}'"));
-    format!("{flag} expects {choices}, got {got}")
-}
-
 fn main() {
     let args = parse_args().unwrap_or_else(|e| {
         eprintln!("ffetch: {e}\nTry 'ffetch --help'.");
         exit(2);
     });
-    let mode = ColorMode::detect(args.no_color);
-    let ids = match &args.modules {
-        Some(list) => module_list(list),
-        None => info::default_modules(),
+    let out = match &args.output {
+        // Only the template's modules run: no config file, logo or palette.
+        Output::Line(template) if !args.print_config => {
+            template.line(&info::Ctx::live(args.refresh)) + "\n"
+        }
+        _ => {
+            let config = settings(&args);
+            match (&args.output, args.print_config) {
+                (_, true) => config.to_toml(),
+                (Output::Json, _) => json(&args, &config),
+                _ => text(&args, &config),
+            }
+        }
     };
-    let image = load_image(&args);
+    // Ignore errors such as a closed pipe (`ffetch | head`).
+    let _ = io::stdout().lock().write_all(out.as_bytes());
+}
+
+/// The settings: the config file's, with the options over them. Problems with
+/// the file are warnings.
+fn settings(args: &Args) -> Config {
+    let (mut config, warnings) = config::load(args.config.as_deref());
+    for warning in warnings {
+        eprintln!("ffetch: {warning}");
+    }
+    let mut flags = args.flags.clone();
+    flags.modules = args.modules.as_deref().map(module_list);
+    config.apply(flags);
+    config
+}
+
+/// The logo, the info and the palette, the usual way.
+fn text(args: &Args, config: &Config) -> String {
+    let mode = ColorMode::detect(args.no_color);
+    let image = load_image(&config.logo);
     let palette = palette::extract(&image.pixels, image.background);
     let ctx = info::Ctx::live(args.refresh);
-    let sys = info::collect(&ctx, &ids);
-    let quip = match args.quip {
+    let sys = info::collect(&ctx, &config.modules);
+    let quip = match config.quip {
         true => {
             let state = quip::State::new(&sys, &ctx);
-            quip::pick(&quip::built_in(), &state, quip::clock_seed())
+            quip::pick(&config.rules(), &state, quip::clock_seed())
         }
         false => None,
     };
     let opts = Options {
-        logo: args.logo,
-        size: args.size,
-        layout: args.layout,
-        bars: args.bars,
+        logo: config.logo.style,
+        size: config.logo.size,
+        layout: config.layout,
+        bars: config.bars,
         mode,
-        roles: Theme::default().roles(&palette),
-        swatches: layout::swatch_rows(args.swatches, &palette, mode),
+        roles: config.theme.roles(&palette),
+        swatches: layout::swatch_rows(config.swatches, &palette, mode),
         quip,
     };
-    let out = layout::render(&sys, &image, &opts, term::size());
-    // Ignore errors such as a closed pipe (`ffetch | head`).
-    let _ = io::stdout().lock().write_all(out.as_bytes());
+    layout::render(&sys, &image, &opts, term::size())
+}
+
+/// `--json`: the info and the palette, which still comes from the logo image.
+fn json(args: &Args, config: &Config) -> String {
+    let image = load_image(&config.logo);
+    let palette = palette::extract(&image.pixels, image.background);
+    let ctx = info::Ctx::live(args.refresh);
+    let sys = info::collect(&ctx, &config.modules);
+    output::json::render(&sys, &palette, config.theme.roles(&palette))
 }
 
 /// The modules named in `--modules`, with a warning for each name that isn't
@@ -229,13 +282,13 @@ fn module_list(list: &str) -> Vec<&'static str> {
     ids
 }
 
-/// The logo image: `--image` if it loads, otherwise the embedded one. A broken
-/// image costs one warning, never the run.
-fn load_image(args: &Args) -> LogoImage {
-    let Some(path) = &args.image else {
+/// The logo image: `logo.image` if it loads, otherwise the embedded one. A
+/// broken image costs one warning, never the run.
+fn load_image(logo: &config::Logo) -> LogoImage {
+    let Some(path) = &logo.image else {
         return LogoImage::embedded();
     };
-    match cache::image(path, args.keep_background, cache::dir().as_deref()) {
+    match cache::image(path, logo.keep_background, cache::dir().as_deref()) {
         Ok(img) => img.into(),
         Err(e) => {
             eprintln!("ffetch: can't load image {path:?}: {e}; using the built-in logo");
