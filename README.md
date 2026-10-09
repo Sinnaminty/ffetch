@@ -6,7 +6,7 @@ for the whole output from that image, treats WSL as a first-class platform,
 and has an attitude.
 
 ```
-            |%#%_||     _;;:       fizz@KUS-ITPROG2
+            |%#%_||     _;;:       fizz@fizzbox
        ;| |#@@@#@#x#%;ooooo;       ----------------
       :o#%#@@@@##%%%xoooxooo%%x    OS: Ubuntu 24.04.5 LTS x86_64
    __ x%#@@@@@###o;ooo;xxoo#@#x;   Host: Windows Subsystem for Linux 2.6.3.0 (Ubuntu)
