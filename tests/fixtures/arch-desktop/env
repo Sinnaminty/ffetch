@@ -1,0 +1,12 @@
+# The environment ffetch sees, one KEY=VALUE per line.
+USER=ada
+HOME=/home/ada
+SHELL=/usr/bin/bash
+LANG=en_US.UTF-8
+TERM=xterm-kitty
+KITTY_WINDOW_ID=1
+DISPLAY=:1
+WAYLAND_DISPLAY=wayland-0
+XDG_CURRENT_DESKTOP=KDE
+XDG_SESSION_TYPE=wayland
+DESKTOP_SESSION=plasma

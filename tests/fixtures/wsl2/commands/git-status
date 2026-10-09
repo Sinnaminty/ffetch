@@ -1,0 +1,11 @@
+program: git
+arg: --no-optional-locks
+arg: status
+arg: --porcelain=v2
+arg: --branch
+cwd: /home/dev/proj
+---
+# branch.oid 9fceb02d0ae598e95dc970b74767f19372d61af8
+# branch.head main
+# branch.upstream origin/main
+# branch.ab +0 -0

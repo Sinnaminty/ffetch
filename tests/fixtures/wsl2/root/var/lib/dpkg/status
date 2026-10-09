@@ -1,0 +1,62 @@
+Package: base-files
+Status: install ok installed
+Priority: optional
+Section: misc
+Architecture: amd64
+Version: 1.0-1
+Description: base-files
+ Synthetic entry.
+
+Package: bash
+Status: install ok installed
+Priority: optional
+Section: misc
+Architecture: amd64
+Version: 1.0-1
+Description: bash
+ Synthetic entry.
+
+Package: coreutils
+Status: install ok installed
+Priority: optional
+Section: misc
+Architecture: amd64
+Version: 1.0-1
+Description: coreutils
+ Synthetic entry.
+
+Package: linux-image-old
+Status: deinstall ok config-files
+Priority: optional
+Section: misc
+Architecture: amd64
+Version: 1.0-1
+Description: linux-image-old
+ Synthetic entry.
+
+Package: libc6
+Status: install ok installed
+Priority: optional
+Section: misc
+Architecture: amd64
+Version: 1.0-1
+Description: libc6
+ Synthetic entry.
+
+Package: zsh
+Status: install ok installed
+Priority: optional
+Section: misc
+Architecture: amd64
+Version: 1.0-1
+Description: zsh
+ Synthetic entry.
+
+Package: tmux
+Status: install ok installed
+Priority: optional
+Section: misc
+Architecture: amd64
+Version: 1.0-1
+Description: tmux
+ Synthetic entry.

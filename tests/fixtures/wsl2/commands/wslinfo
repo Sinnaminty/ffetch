@@ -1,0 +1,4 @@
+program: wslinfo
+arg: --version
+---
+2.6.3.0

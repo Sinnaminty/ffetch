@@ -1,6 +1,8 @@
 # ffetch — Differentiation Spec
 
-Status: Draft · 2026-10-08 · Takes ffetch from 0.1.0 to 0.2.0
+Status: Implemented (M1–M6) on branch `spec-v0.2` · 2026-10-08 · Takes ffetch from 0.1.0 to 0.2.0
+
+Decisions made during implementation are folded into the sections below; §8 notes the current behavior for each open question.
 
 ## 1. Context
 
@@ -46,7 +48,7 @@ Status: Draft · 2026-10-08 · Takes ffetch from 0.1.0 to 0.2.0
 |----|-------------|
 | R1 | **Performance budget.** A default run (warm cache) takes ≤ 25 ms wall time on the dev machine, measured with `hyperfine -N --warmup 3 ffetch`. Every module has a cost class (§5.2). A module in the `slow` class (> 50 ms) must be either cached (F2.5) or opt-in. |
 | R2 | **Silent degradation.** A module that can't determine its value is omitted. It never prints an error and never fails the run. |
-| R3 | **Color modes.** Every feature works in truecolor, 256-color and no-color modes. No-color output stays readable and uses ASCII fallbacks where Unicode glyphs carry meaning. |
+| R3 | **Color modes.** Every feature works in truecolor, 256-color and no-color modes. No-color output stays readable. Where a glyph's meaning depends on color (the usage bars), it gets an ASCII fallback. Other Unicode (`↑↓`, `°`, `·`, box drawing) is used as is. |
 | R4 | **Determinism.** The same image always produces the same logo and palette. Output is stable between runs except for live values (and the quip, F4). |
 | R5 | **Dependencies.** Each new crate needs a stated reason in its PR. Expected additions: `png` (moves from a build-only dependency to a runtime one, for F1.1), plus `serde`, `serde_json` and `toml` (F5). |
 | R6 | **Precedence.** CLI flags override the config file, and the config file overrides built-in defaults. |
@@ -60,9 +62,10 @@ Status: Draft · 2026-10-08 · Takes ffetch from 0.1.0 to 0.2.0
 **Behavior**
 
 - `ffetch --image PATH` uses PATH as the logo instead of the embedded image. Config key: `logo.image`.
-- It runs the same pipeline as `build.rs` today: decode, remove the background, downsample to 256 px. It also downsamples to at most 1024 px **before** removing the background, so large photos stay fast.
+- It runs the same pipeline as `build.rs` today: decode, remove the background, downsample to 256 px. Images larger than 2048 px are first shrunk to at most 1024 px **before** background removal, so large photos stay fast. (Smaller images skip this step so the default logo's output doesn't change.)
 - `--keep-background` (config `logo.keep_background`) skips background removal, for images where the background is part of the picture.
-- The processed buffer is cached at `${XDG_CACHE_HOME:-~/.cache}/ffetch/images/<key>.rgba`. The key hashes the canonical path, file size and mtime. The cache file has a small header with width, height and the removed background color.
+- The processed buffer is cached at `${XDG_CACHE_HOME:-~/.cache}/ffetch/images/<key>.rgba`. The key is an FNV-1a hash of the canonical path, file size, mtime, `--keep-background`, the crate version and a format marker. The cache file has a small header with width, height and the removed background color.
+- Images over 64 megapixels are refused with the usual single warning, so a crafted file can't exhaust memory.
 - If the image fails to load, ffetch prints one warning line to stderr, uses the embedded logo, and exits 0. A broken image must never break someone's shell startup.
 - Only PNG is supported in this phase.
 
@@ -85,14 +88,14 @@ Status: Draft · 2026-10-08 · Takes ffetch from 0.1.0 to 0.2.0
 - Algorithm: k-means in Oklab, k = 6, k-means++ initialization with a fixed seed, 10 iterations. Drop clusters holding less than 2% of the pixels. The fixed seed satisfies R4.
 - Assign three theme roles:
   - `accent`: labels and the user name. Use the removed background color if there was one (this is today's behavior); otherwise the cluster with the highest chroma × weight among clusters with lightness between 0.35 and 0.80.
-  - `secondary`: the host name and bar fill. The most chromatic remaining cluster that differs from `accent` by ΔE_ok > 0.15.
   - `muted`: the separator line and the `@`. The cluster with the lowest chroma among clusters with lightness between 0.4 and 0.8.
-- Role colors are adjusted for the terminal background (`theme.background = "dark" | "light"`, default dark). Dark backgrounds get the same lightness lift the logo uses; light backgrounds get the mirror-image darkening.
+  - `secondary`: the host name. The **most common** cluster with lightness ≥ 0.35 that is more than ΔE_ok 0.15 from `accent` and more than 0.05 from `muted`; if none qualifies, the accent. (The first draft picked the most chromatic cluster, but on the reference image that was a near-black, which made the host name unreadable.)
+- Role colors are adjusted for the terminal background (`theme.background = "dark" | "light"`, default dark). On a dark background, a color with HSL lightness below 0.45 is raised to 0.45; on a light background, one above 0.55 is lowered to 0.55. Every other color stays exactly as it is in the image.
 - Overrides: `theme.accent`, `theme.secondary` and `theme.muted` accept `#rrggbb`.
 
 **Acceptance**
 
-- For `assets/logo.png`, `accent` is `#C33E58` and the palette contains colors close to cream `#F2D7C5`, rose-beige `#C9A69D`, dark mauve `#473D46` and maroon `#633540`. Assert with ΔE_ok < 0.05.
+- For `assets/logo.png`, `accent` is `#C33E58`; the palette contains colors close to cream `#F2D7C5`, rose-beige `#C9A69D` and dark mauve `#473D46` (ΔE_ok < 0.05); `secondary` is the cream and `muted` the rose-beige. (Maroon `#633540` was also listed originally, but k-means merges it into dark mauve for every seed and sample size tried, so it was dropped.)
 - Running twice on the same image gives an identical palette.
 
 #### F1.3 Themed output and swatches
@@ -158,7 +161,7 @@ Measured on the dev machine:
 
 #### F3.1 Usage bars
 
-- Memory, Disk and Battery show a 10-cell bar right after the label: `Memory: ██░░░░░░░░ 1.86 GiB / 15.48 GiB (12%)`.
+- Memory, Disk and Battery show a 10-cell bar right after the label: `Memory: ██░░░░░░░░ 1.86 GiB / 15.48 GiB (12%)`. Filled cells are `ceil(pct / 10)`. Empty cells use the theme's `muted` color. Each battery gets its own bar.
 - Bar color uses these thresholds:
 
   | Level | Usage | Battery charge |
@@ -167,7 +170,7 @@ Measured on the dev machine:
   | warn | 60–85% | 15–40% |
   | crit | > 85% | < 15% |
 
-  The colors are ANSI green, yellow and red (SGR 32/33/31), so they follow the user's terminal theme.
+  The filled cells use ANSI green, yellow and red (SGR 32/33/31), so they follow the user's terminal theme.
 - In no-color mode the bar is drawn in ASCII: `[##--------]`.
 - Toggle with `--no-bars` or config `bars = false`.
 
@@ -177,24 +180,26 @@ Measured on the dev machine:
 |----|-------|--------|------|---------|
 | `load` | Load | `/proc/loadavg`, shown with the thread count: `0.14, 0.15, 0.08 (16 threads)` | fast | on |
 | `temp` | CPU Temp | `/sys/class/hwmon/*` where the name is `coretemp`, `k10temp` or `zenpower`; otherwise `/sys/class/thermal/thermal_zone*` with type `x86_pkg_temp`. Hidden on WSL, which exposes neither. | fast | on |
-| `git` | Git | `git status --porcelain=v2 --branch` in the current directory: `main ↑1 ↓0, 3 changed`. Only shown inside a repo. 50 ms timeout, then hidden. | spawn | on |
+| `git` | Git | `git --no-optional-locks status --porcelain=v2 --branch` in the current directory: `main ↑1 ↓0, 3 changed` or `main, clean`. Arrows appear only when ahead/behind isn't 0:0. A detached HEAD shows the short oid. Only shown inside a repo. 50 ms timeout, then hidden. `--no-optional-locks` matters: a timed-out run must not leave an `index.lock` behind. | spawn | on |
 | `toolchains` | Toolchains | `rustc --version`, `node --version`, `python3 --version`, all in parallel: `rust 1.98.1 · node 22.x · python 3.12`. Shows only the ones installed. | spawn (20–30 ms each, through rustup proxies) | off |
-| `docker` | Containers | `GET /containers/json` over `/var/run/docker.sock` using a std `UnixStream` (no `docker` process): `3 running`. Hidden if the socket is missing or not accessible. | fast | off |
+| `docker` | Containers | `GET /containers/json` (HTTP/1.0) over `/var/run/docker.sock` using a std `UnixStream` (no `docker` process): `3 running`. 100 ms timeout. Hidden if the socket is missing or not accessible, or the reply isn't a complete 200. | fast | off |
 | `ip` | Local IP | `getifaddrs`, first IPv4 address that isn't loopback: `192.168.1.20 (eth0)` | fast | off (people post screenshots) |
 | `updates` | Updates | Ubuntu: parse `/var/lib/update-notifier/updates-available`. Never run a package-manager query. | fast | off |
 
-Default order for the info column: OS, Host, Windows, Kernel, Uptime, Packages, Shell, Resolution, DE, WM, Terminal, CPU, CPU Temp, Load, GPU, Memory, Disk, Battery, Git, Locale. Opt-in modules are appended in the order they are enabled.
+Default order for the info column: OS, Host, Windows, Kernel, Uptime, Packages, Shell, Resolution, DE, WM, Terminal, CPU, CPU Temp, Load, GPU, Memory, Disk, Battery, Git, Locale.
+
+`--modules id,id,...` replaces the module list, in the given order; it's how opt-in modules are enabled from the command line, and it overrides the config file's `modules` (R6). Each unknown id produces one warning and is skipped.
 
 #### F3.3 Responsive layout
 
 - `--layout auto|side|stacked` (config `layout`), default `auto`.
 - `auto`:
   1. **Side by side** if the logo can be at least 16 columns wide with the info column at least 32 (this is today's logic).
-  2. Otherwise **stacked**: the logo goes above the info, at width `min(48, terminal width)`, if the logo rows plus the info rows plus 2 fit in the terminal height.
+  2. Otherwise **stacked**: the logo goes above the info, left-aligned, with a blank row between them. Its width is `min(48, terminal width, the widest whose rows fit in terminal height − info rows − 3)`, and it must be at least 16 columns.
   3. Otherwise no logo (this is today's fallback).
-- Today, terminals narrower than about 51 columns lose the logo completely.
+- `side` and `stacked` force that arrangement, with no logo if it doesn't fit. An explicit `--size` skips the height-based shrinking.
 
-**Acceptance:** table-driven tests for terminal sizes 200×50, 120×30, 80×24, 50×40, 40×20 and 30×10 that check the chosen layout and logo width.
+**Acceptance:** table-driven tests for terminal sizes 200×50, 120×30, 80×24, 50×40, 40×20 and 30×10 (and the boundaries around them) that check the chosen layout and logo width.
 
 ### F4 — Personality: quips
 
@@ -208,20 +213,22 @@ Default order for the info column: OS, Host, Windows, Kernel, Uptime, Packages, 
    ╰──────────────────────────────────╯
   ```
 
-  In no-color mode the bubble is drawn with `+ - |`.
-- Rules are checked in priority order and the first match wins. Each rule has several templates; one is picked at random per run, seeded from the clock. Placeholders are filled from module data.
+  In no-color mode the bubble is drawn with `+ - |`. Without a logo beside it (stacked or no logo) there is no tail. The border uses the `muted` role. On a narrow column the text is truncated with `…`, and the bubble is dropped if it would be narrower than 12 columns.
+- Rules are checked in priority order and the first match wins (user rules first). Each rule has several templates; one is picked at random per run, seeded from the clock. Placeholders are filled from module data.
 
-| Priority | Condition | Example templates |
+| Priority | Condition (`when`) | Templates |
 |----------|-----------|-------------------|
-| 1 | Battery < 15% and discharging | `{battery}% battery. living dangerously.` · `plug me in.` |
-| 2 | Memory ≥ 90% | `{mem_pct}% RAM. what are you doing.` |
-| 3 | Disk ≥ 90% | `disk's {disk_pct}% full. delete something.` |
-| 4 | 1-minute load > thread count | `load {load1} on {threads} threads. breathe.` |
-| 5 | Uptime ≥ 7 days | `{uptime_days} days without a reboot. bold.` |
-| 6 | Local time 00:00–04:59 | `it's {hour}am. go to sleep.` |
-| 7 | Running as root | `running a fetch as root. sure.` |
-| 8 | Packages > 3000 | `{packages} packages. hoarder.` |
-| 9 | Fallback | `what.` · `fine. here are your stats.` · `don't screenshot me.` |
+| 1 | `battery < 15 and battery_discharging == 1` | `{battery}% battery. living dangerously.` · `plug me in.` · `{battery}% left. find a charger.` |
+| 2 | `mem_pct >= 90` | `{mem_pct}% ram. i'm drowning.` · `memory's at {mem_pct}%. close a tab.` · `{mem_pct}% memory used. i can't think.` |
+| 3 | `disk_pct >= 90` | `disk's {disk_pct}% full. delete something.` · `disk at {disk_pct}%. no room for anything.` |
+| 4 | `load_ratio > 1` | `load {load1} on {threads} threads. breathe.` · `load {load1}. one thing at a time.` · `everything at once? load {load1}.` |
+| 5 | `uptime_days >= 7` | `{uptime_days} days without a reboot. bold.` · `up {uptime_days} days. i could use a nap.` · `{uptime_days} days up. reboot me already.` |
+| 6 | `hour < 5` | `it's {clock}. go to sleep.` · `it's {clock}. let me sleep.` · `{clock}. nothing good happens now.` |
+| 7 | `root == 1` | `running a fetch as root. sure.` · `root? for a fetch? fine.` |
+| 8 | `packages > 3000` | `{packages} packages. i'm stuffed.` · `{packages} packages. i'm full.` · `{packages} packages and counting. ugh.` |
+| 9 | always | `what.` · `fine. here are your stats.` · `don't screenshot me.` |
+
+Conditions use a small language: `<name> <op> <number>` joined by `and`, with ops `< <= > >= == !=`. Built-in and user rules share it. Names: `battery`, `battery_discharging` (0/1), `mem_pct`, `disk_pct`, `load1`, `threads`, `load_ratio` (load1 / threads), `uptime_days`, `hour` (0–23), `root` (0/1), `packages`. A name whose module didn't run or had no value is undefined, and any condition using it is false. Unknown names and placeholders are parse errors. In templates, `{clock}` renders the hour as `2am`/`12pm`, `{packages}` gets thousands separators, and `{load1}` one decimal.
 
 - Tone: grumpy, at most 40 characters, lowercase. No profanity, and never about the user as a person — only about the machine.
 - On by default. Disable with `--no-quip` or config `quip = false`. Users can override or extend rules with `[[quip.rule]]` tables in the config (they take priority over the built-ins).
@@ -250,14 +257,18 @@ Default order for the info column: OS, Host, Windows, Kernel, Uptime, Packages, 
   }
   ```
 
-- `schema` is incremented on any breaking change. Modules with no value are left out; they are never `null`.
+- `schema` is incremented on any breaking change. Modules with no value, and unknown fields within a value, are left out; they are never `null`.
+- `gpu` entries are `{name, source, vendor?}`: `source` is `pci`, `nvidia-smi` or `powershell`, and `vendor` appears only when known (PCI, nvidia-smi). Other shapes: `packages` is `{total, managers: {dpkg: N, …}}`, `resolution` a list of `{width, height}`, `battery` a list of `{pct, status}`, `toolchains` a map of name to version, `git` has separate `ahead`/`behind`.
+- The palette's role colors are the ones actually painted (after background adjustment and overrides); `colors` are the image's own.
 - Including `palette` means other tools (status bars, terminal themes) can take their colors from the same image.
 
 #### F5.2 One-line output (`--format`, `--oneline`)
 
 - `--format '<template>'` with `{module}` placeholders, e.g. `--format '{os} · up {uptime} · mem {memory.pct}%'`.
 - `--oneline` is a preset: `{os} · up {uptime} · mem {memory.pct}% · disk {disk.pct}%`.
-- Only the modules named in the template are run. Intended for MOTDs, prompts and status bars, so it must meet R1 easily.
+- Only the modules named in the template are run. Intended for MOTDs, prompts and status bars, so it must meet R1 easily (measured: ~1.3 ms for `--oneline`).
+- An unknown module or field is a usage error (exit 2), reported before anything runs. A module with no value at runtime renders as an empty string. `{{` and `}}` are literal braces. Multi-line values are joined with `, `.
+- `--format` and `--oneline` don't read the config file. `--json`, `--format` and `--oneline` are mutually exclusive.
 
 #### F5.3 Config file
 
@@ -269,7 +280,6 @@ Default order for the info column: OS, Host, Windows, Kernel, Uptime, Packages, 
 layout = "auto"          # auto | side | stacked
 swatches = "palette"     # palette | ansi | none
 bars = true
-quip = true
 modules = ["os", "host", "windows", "kernel", "uptime", "packages", "shell",
            "terminal", "cpu", "gpu", "memory", "disk", "battery", "git"]
 
@@ -283,12 +293,22 @@ keep_background = false
 background = "dark"      # dark | light
 # accent = "#c33e58"
 
+[quip]                   # or just `quip = false` at the top level
+enabled = true
+
 [[quip.rule]]
 when = "uptime_days >= 30"
 say = ["a month. impressive. concerning."]
 ```
 
-The `when` expressions in user quip rules are limited to `<field> <op> <number>`, with `and` between conditions. Fields are the placeholders from F4. There is no general expression language.
+The `when` expressions in user quip rules use the condition language from F4. A rule without `when` always matches, which replaces the fallback. Bad rules are skipped with a warning naming the rule number; a `say` string over 40 characters warns but is kept.
+
+Error handling (a fetch tool runs at shell startup and must never break it):
+- A missing default config is silent. A missing `--config` path warns once.
+- A TOML syntax error warns once, with `file:line:column`, and the file is ignored.
+- Unknown keys, invalid values and unknown module ids each warn once and fall back to the default for that key.
+- A relative `logo.image` is resolved against the config file's directory; `~` is expanded.
+- `--print-config` writes unset keys as comments, since TOML has no null.
 
 ## 5. Architecture changes
 
@@ -348,10 +368,12 @@ M1 and M2 are the most distinctive and the most visible, so they come first. The
 
 ## 8. Open questions
 
-1. **Quips on by default?** The spec says yes because it's the most memorable feature. It could be off by default for a quieter tool.
-2. **Light terminals:** auto-detect the background with an OSC 11 query (adds a terminal round trip and is complicated when output isn't a TTY), or rely on `theme.background` only?
-3. **Value color:** values currently stay the terminal's default color. Should they be themed too?
-4. **Non-NVIDIA GPUs on WSL:** is a `powershell.exe` call (hundreds of ms, once per boot) acceptable, or should they stay as "Basic Render Driver"?
-5. **Image formats:** add JPEG/WebP (the `image` crate adds compile time; `zune-jpeg` is lighter) or keep PNG only?
-6. **JSON stability:** commit to `schema: 1` as public at 0.2.0, or keep it experimental until 1.0?
-7. **Windows Terminal profile name (F2.4 stretch):** worth the complexity?
+1. **Quips on by default?** The spec says yes because it's the most memorable feature. It could be off by default for a quieter tool. *Currently: on; `--no-quip` or `quip = false`.*
+2. **Light terminals:** auto-detect the background with an OSC 11 query (adds a terminal round trip and is complicated when output isn't a TTY), or rely on `theme.background` only? *Currently: config only. The light theme adjusts the title, labels and borders, but the ASCII logo is still tuned for dark backgrounds, so its cream areas look pale on white.*
+3. **Value color:** values currently stay the terminal's default color. Should they be themed too? *Currently: default color.*
+4. **Non-NVIDIA GPUs on WSL:** is a `powershell.exe` call (hundreds of ms, once per boot) acceptable, or should they stay as "Basic Render Driver"? *Currently: PowerShell fallback, measured at 0.6–0.75 s on the first run after a boot.*
+5. **Image formats:** add JPEG/WebP (the `image` crate adds compile time; `zune-jpeg` is lighter) or keep PNG only? *Currently: PNG only.*
+6. **JSON stability:** commit to `schema: 1` as public at 0.2.0, or keep it experimental until 1.0? *Currently: `schema: 1`, no stability promise written down.*
+7. **Windows Terminal profile name (F2.4 stretch):** worth the complexity? *Currently: not implemented.*
+8. **Interop without `appendWindowsPath`:** `cmd.exe` and `powershell.exe` are found through `PATH`, so they're missing when WSL's `appendWindowsPath=false`. Fall back to `/mnt/c/Windows/System32/...`? *Currently: no fallback; the Windows line is hidden and the GPU falls back to the PCI name.*
+9. **`--format` extras:** `{user}` and `{hostname}` placeholders for prompts? *Currently: module placeholders only.*

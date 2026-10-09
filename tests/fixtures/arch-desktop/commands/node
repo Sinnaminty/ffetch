@@ -1,0 +1,4 @@
+program: node
+arg: --version
+---
+v22.11.0

@@ -1,0 +1,5 @@
+program: /usr/lib/wsl/lib/nvidia-smi
+arg: --query-gpu=name
+arg: --format=csv,noheader
+---
+NVIDIA T1200 Laptop GPU

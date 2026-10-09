@@ -1,0 +1,93 @@
+{
+  "schema": 1,
+  "user": "dev",
+  "host": "DEVBOX",
+  "palette": {
+    "accent": "#c33e58",
+    "secondary": "#f2d7c5",
+    "muted": "#c9a59d",
+    "colors": [
+      "#f2d7c5",
+      "#c9a59d",
+      "#493943",
+      "#200815",
+      "#32202b",
+      "#8f5e66"
+    ]
+  },
+  "modules": {
+    "os": {
+      "name": "Ubuntu 24.04.5 LTS",
+      "arch": "x86_64"
+    },
+    "host": {
+      "name": "Windows Subsystem for Linux 2.6.3.0 (Ubuntu)"
+    },
+    "windows": {
+      "name": "Windows 11",
+      "build": 26300
+    },
+    "kernel": {
+      "release": "6.6.87.2-microsoft-standard-WSL2"
+    },
+    "uptime": {
+      "seconds": 21919
+    },
+    "packages": {
+      "total": 6,
+      "managers": {
+        "dpkg": 6
+      }
+    },
+    "shell": {
+      "name": "zsh",
+      "version": "5.9"
+    },
+    "terminal": {
+      "name": "tmux"
+    },
+    "cpu": {
+      "name": "11th Gen Intel Core i7-11850H",
+      "threads": 16,
+      "ghz": 2.5
+    },
+    "load": {
+      "load1": 0.14,
+      "load5": 0.15,
+      "load15": 0.08,
+      "threads": 16
+    },
+    "gpu": [
+      {
+        "vendor": "NVIDIA",
+        "name": "T1200 Laptop GPU",
+        "source": "nvidia-smi"
+      }
+    ],
+    "memory": {
+      "used_bytes": 2777526272,
+      "total_bytes": 16624304128,
+      "pct": 16
+    },
+    "disk": {
+      "used_bytes": 85221023744,
+      "total_bytes": 1081101176832,
+      "pct": 8
+    },
+    "battery": [
+      {
+        "pct": 100,
+        "status": "Full"
+      }
+    ],
+    "git": {
+      "branch": "main",
+      "ahead": 0,
+      "behind": 0,
+      "changed": 0
+    },
+    "locale": {
+      "name": "C.UTF-8"
+    }
+  }
+}
