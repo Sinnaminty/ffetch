@@ -1,9 +1,9 @@
 # ffetch
 
 A neofetch-style system info tool for Linux, built around *your* image.
-ffetch turns any PNG into colored ASCII art on its own, takes the color theme
-for the whole output from that image, treats WSL as a first-class platform,
-and has an attitude.
+ffetch draws any PNG in the terminal on its own, as colored half-block pixels
+or ASCII art, takes the color theme for the whole output from that image,
+treats WSL as a first-class platform, and has an attitude.
 
 ```
             |%#%_||     _;;:       fizz@fizzbox
@@ -30,7 +30,8 @@ oo;x%x%#######ox%######%%x;;;;;;   Battery: [##########] 100% [Full]
                                     +-------+
 ```
 
-That's `ffetch --no-color --size 32`. In a color terminal the logo, labels and
+That's `ffetch --logo ascii --no-color --size 32`. By default the logo is
+drawn in half-block pixels instead. In a color terminal the logo, labels and
 title are painted in colors taken from the image, the usage bars are drawn as
 `██░░░░░░░░` in green, yellow or red, and the speech bubble has rounded
 corners.
@@ -38,8 +39,8 @@ corners.
 ## Features
 
 - **Any image as the logo.** `--image photo.png` removes the background,
-  downsamples and renders the picture as ASCII (`--logo ascii`) or half-block
-  pixels (`--logo blocks`), scaled to fit the terminal.
+  downsamples and renders the picture as half-block pixels (`--logo blocks`,
+  the default) or ASCII art (`--logo ascii`), scaled to fit the terminal.
 - **A theme from the image.** A palette is extracted from the logo (k-means in
   Oklab, deterministic), and its colors are used for the user and host name,
   the labels, the separator and the color swatches.
@@ -81,7 +82,7 @@ To run ffetch whenever a shell starts, add `ffetch` to the end of your
 ```sh
 ffetch                               # logo and info
 ffetch --image ~/Pictures/cat.png    # another logo, and a theme to match
-ffetch --logo blocks --size 40       # half-block pixels, 40 columns wide
+ffetch --logo ascii --size 40        # ASCII art, 40 columns wide
 ffetch --layout stacked              # logo above the info
 ffetch --modules os,uptime,load,git  # just these, in this order
 ffetch --oneline                     # Ubuntu 24.04.5 LTS x86_64 · up 2 hours, 32 mins · mem 6% · disk 8%
@@ -91,7 +92,7 @@ ffetch --json | jq .palette
 
 | Option | |
 |--------|-|
-| `-l`, `--logo <style>` | `ascii` (default), `blocks` or `none` |
+| `-l`, `--logo <style>` | `blocks` (default), `ascii` or `none`. Without color, `blocks` is only a silhouette; `ascii` keeps the detail |
 | `-s`, `--size <cols>` | Logo width in columns (default 48; shrinks to fit the terminal) |
 | `--image <path>` | Use a PNG as the logo and take the colors from it |
 | `--keep-background` | With `--image`, keep the image's background instead of removing it |
@@ -159,7 +160,7 @@ modules = ["os", "host", "windows", "kernel", "uptime", "packages", "shell",
            "terminal", "cpu", "gpu", "memory", "disk", "battery", "git"]
 
 [logo]
-style = "ascii"          # ascii | blocks | none
+style = "blocks"         # blocks | ascii | none
 size = 48
 image = "~/Pictures/avatar.png"   # relative paths are relative to this file
 keep_background = false

@@ -137,7 +137,7 @@ impl Default for Config {
             quip_rules: Vec::new(),
             modules: info::default_modules(),
             logo: Logo {
-                style: Some(Style::Ascii),
+                style: Some(Style::Blocks),
                 size: None,
                 image: None,
                 keep_background: false,
@@ -801,7 +801,7 @@ say = ["hi.", "hello."]
             (Layout::Auto, Swatches::Palette, true, true)
         );
         assert_eq!(defaults.modules, info::default_modules());
-        assert_eq!(defaults.logo.style, Some(Style::Ascii));
+        assert_eq!(defaults.logo.style, Some(Style::Blocks));
         assert_eq!(defaults.theme, Theme::default());
     }
 
@@ -984,13 +984,13 @@ say = ["a month. impressive. concerning."]
             (info::default_modules(), vec!["os", "kernel"], vec!["ip"]),
         );
         check(
-            "[logo]\nstyle = \"blocks\"",
+            "[logo]\nstyle = \"ascii\"",
             Flags {
                 style: Some(None),
                 ..Flags::default()
             },
             |c| c.logo.style,
-            (Some(Style::Ascii), Some(Style::Blocks), None),
+            (Some(Style::Blocks), Some(Style::Ascii), None),
         );
         check(
             "[logo]\nsize = 30",
@@ -1307,7 +1307,7 @@ say = ["kept."]
             "quip = true",
             "modules = [\"os\", \"host\", \"windows\", \"kernel\", \"uptime\", \"packages\", \"shell\",",
             "[logo]",
-            "style = \"ascii\"",
+            "style = \"blocks\"",
             "# size = 48  # unset: shrinks to fit the terminal",
             "keep_background = false",
             "[theme]",

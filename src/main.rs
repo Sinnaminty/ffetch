@@ -31,7 +31,7 @@ ffetch - a neofetch-style system info tool
 Usage: ffetch [options]
 
 Options:
-  -l, --logo <style>     Logo style: ascii (default), blocks, none
+  -l, --logo <style>     Logo style: blocks (default), ascii, none
   -s, --size <cols>      Logo width in columns (default 48; shrinks to fit the terminal)
       --image <path>     Use a PNG image as the logo and take the colors from it
       --keep-background  With --image, keep the image's background instead of removing it
